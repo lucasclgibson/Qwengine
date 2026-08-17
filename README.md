@@ -38,39 +38,46 @@ would. Every prompt is run once to warm and then measured.
   ~250 tok/s on a 900-token prompt, ~215 tok/s on a 2800-token one.
 - Weights on disk: **16.7 GB**. Cold start ~40 s, warm start ~4 s.
 
-### Honesty about the target and about SGLang
+### Where this actually stands against SGLang
 
-The goal for this engine was **30 tok/s decode**. It does not hit that. It runs
-22.5–27.4 tok/s depending on how predictable the text is, and the section below
-says exactly where the missing time goes and what it would take to get it.
+Both engines run on this machine and are driven by the same script over their
+own HTTP endpoints. Two methodology notes, because the naive versions of these
+measurements are all wrong in SGLang's favour or ours:
 
-It was also meant to beat a well-tuned SGLang setup on the same box "by a
-significant margin". It does not. Both were run on this machine and driven by
-the same `tools/bench.py` over their own HTTP endpoints, same prompts, same
-128-token budget:
+- **Decode is measured by differencing.** Each prompt is run to 24 tokens and to
+  184, and the rate is the difference over the difference, which cancels prefill
+  exactly. Dividing total tokens by total wall time (the obvious version)
+  charges prefill to decode and flatters whichever engine caches prompts.
+- **Prefill uses a fresh random document every time**, so neither engine's
+  prefix cache can serve it. Re-using prompts across runs let SGLang's radix
+  cache answer a 2700-token prefill in 0.13 s, which is not prefill at all.
 
-| prompt | qwengine | SGLang | |
+| | qwengine | SGLang | |
 |---|---|---|---|
-| reasoning | 20.5 | **21.4** | SGLang |
-| code | 23.2 | **24.0** | SGLang |
-| factual | 19.9 | **23.5** | SGLang |
-| chat | **25.4** | 24.5 | qwengine |
-| **overall** | 22.5 | **23.2** | SGLang by 3% |
+| decode, reasoning | **23.9** | 19.2 | tok/s |
+| decode, code | 33.5 | **36.2** | tok/s |
+| decode, chat | **28.0** | 27.4 | tok/s |
+| decode, essay | **22.2** | 21.2 | tok/s |
+| **decode overall** | **26.1** | 25.6 | tok/s |
+| prefill, 2270 tokens | 486 | **2385** | tok/s |
+| prefill, 6731 tokens | 316 | **1941** | tok/s |
 
-(SGLang: `lmsysorg/sglang:qwen38-27b`, `RadixArk/Qwen3.8-27B-NVFP4`, EAGLE
-speculation, FP8 KV cache, flashinfer. Both engines resident simultaneously,
-only one serving at a time.)
+**Decode is at parity**, winning three prompts of four. **Prefill is still 5-6x
+behind**, and that is the honest headline: this engine is competitive at
+generating tokens and not yet competitive at reading them.
 
-A ~50% win was claimed during development and it was wrong: it compared this
-engine's bare decode loop against a throughput figure quoted in someone else's
-README, which is not a comparison at all. The table above is the version worth
-keeping.
+In a chat client the prefix cache hides most of that, because only the first
+message of a conversation pays full prefill (see below) -- but "hidden" is not
+"fixed", and a long paste still costs real seconds.
 
-What is true is that this lands within 3% of a mature, heavily-engineered stack
-— one built by a team, on top of PyTorch, FlashInfer and CUTLASS — in ~5,800
-lines with no dependencies at all, while also doing vision.
-
----
+What it would take to close the rest is known and measured, not mysterious:
+the prefill GEMM runs at 47 TFLOP/s against a machine peak of 250 (bench/03),
+and it is now occupancy-bound at 16 warps/SM rather than bound by loading,
+dequantising or bank conflicts -- all three were measured away. Getting past
+that needs a CUTLASS-class kernel: `ldmatrix` with XOR-swizzled shared layout,
+asynchronous copy driven by `mbarrier`, and warp specialisation. Beyond it sit
+a chunked DeltaNet formulation (17% of prefill) and a properly tiled flash
+attention (18%).
 
 ## Why it is fast at all
 

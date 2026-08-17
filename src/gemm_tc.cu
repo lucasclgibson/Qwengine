@@ -92,7 +92,15 @@ constexpr int TC_BN = TC_BN_CFG, TC_BT = TC_BT_CFG, TC_BK = TC_BK_CFG;
 // row r starts at bank (r*36) % 32 = 4r % 32: rows 0..7 hit eight different
 // banks and only rows 8 apart collide. 16-way becomes 2-way. 8 is the smallest
 // pad that works because wmma requires ldm to be a multiple of 8 for bf16.
-constexpr int TC_LD = TC_BK + 8;
+// Row-stride pad. 8 was chosen to break the 16-way bank conflict that came
+// from a 128-byte (exactly 32-bank) stride, and that fix was worth 864 -> 696
+// ms. Beyond breaking it, the exact pad does not matter -- swept 8/16/24/32,
+// all within 290/282/282/283 ms -- so residual bank conflicts are NOT what
+// caps this kernel and XOR swizzling would buy nothing. 16 by a nose.
+#ifndef TC_PAD
+#define TC_PAD 16
+#endif
+constexpr int TC_LD = TC_BK + TC_PAD;
 // How many 16x16 fragments each warp owns, in tokens and in outputs. A warp
 // loads WFT + WFN fragments per K-step and issues WFT*WFN MMAs against them, so
 // this ratio is how much tensor-core work each shared-memory read pays for.
