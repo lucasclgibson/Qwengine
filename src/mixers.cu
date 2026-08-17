@@ -347,27 +347,45 @@ __global__ __launch_bounds__(256) void k_attn_decode(
   const float *qh = q + (size_t)b * q_heads * dim + (size_t)h * dim;
   float *scores = scratch + ((size_t)b * q_heads + h) * ctx;
 
-  __shared__ float sq[256], red[32];
+  __shared__ __align__(16) float sq[256];
+  __shared__ float red[32];
   if (d < dim) sq[d] = qh[d];
   __syncthreads();
 
-  // Scores: one thread per timestep, striding.
+  // Scores: one WARP per timestep, not one thread.
+  //
+  // Giving each thread its own timestep looks tidy and is a disaster for
+  // memory. Consecutive lanes then read keys 'kvdim' floats apart -- 4 KB on
+  // this model -- so all 32 lanes of a warp land in 32 different cache lines
+  // and a single warp load costs 32 memory wavefronts instead of one. The
+  // compiler cannot rescue it either: the dot loop emits 256 scalar loads per
+  // lane, none of them vectorised.
+  //
+  // Inverted, a warp owns a timestep and its 32 lanes split the 256 channels
+  // eight apiece, so each lane issues two float4 loads from ONE contiguous
+  // 1 KB key vector: one wavefront per load, and the dot reduces over the warp.
+  const int lane = d & 31, warp = d >> 5;
+  const int nwarp = blockDim.x >> 5;
+  const float4 qa = *(const float4 *)(sq + lane * 4);
+  const float4 qb = *(const float4 *)(sq + 128 + lane * 4);
   float mx = -INFINITY;
-  for (int t = d; t < T; t += blockDim.x) {
+  for (int t = warp; t < T; t += nwarp) {
     const float *kt = kc + (size_t)t * kvdim + (size_t)kvh * dim;
-    float s = 0.f;
-    for (int i = 0; i < dim; ++i) s += sq[i] * kt[i];
-    s *= scale;
-    scores[t] = s;
-    mx = fmaxf(mx, s);
-  }
+    const float4 ka = *(const float4 *)(kt + lane * 4);
+    const float4 kb = *(const float4 *)(kt + 128 + lane * 4);
+    float s = qa.x * ka.x + qa.y * ka.y + qa.z * ka.z + qa.w * ka.w
+            + qb.x * kb.x + qb.y * kb.y + qb.z * kb.z + qb.w * kb.w;
 #pragma unroll
-  for (int o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xFFFFFFFFu, mx, o));
-  if ((d & 31) == 0) red[d >> 5] = mx;
+    for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(0xFFFFFFFFu, s, o);
+    s *= scale;
+    if (lane == 0) scores[t] = s;
+    mx = fmaxf(mx, s);            // s is warp-uniform after the reduction
+  }
+  if (lane == 0) red[warp] = mx;
   __syncthreads();
   if (d == 0) {
     float m = -INFINITY;
-    for (int i = 0; i < blockDim.x / 32; ++i) m = fmaxf(m, red[i]);
+    for (int i = 0; i < nwarp; ++i) m = fmaxf(m, red[i]);
     red[0] = m;
   }
   __syncthreads();
