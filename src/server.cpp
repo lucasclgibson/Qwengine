@@ -294,6 +294,15 @@ struct Engine {
   // history every message, and time-to-first-token grew without limit: 30
   // seconds at 5400 tokens of context, against SGLang's 1.3.
   std::vector<int> cached;
+  // The TEXT those tokens came from: the last prompt, plus the reply the model
+  // generated after it. Kept because re-tokenising is not stable across a
+  // truncation. If a reply is cut off by max_tokens mid-word, re-encoding it as
+  // part of the next prompt can yield different ids at the seam, the token
+  // prefix stops matching, and a conversation that should cost 0.3 s costs 5.
+  // Splitting the new prompt on this string instead sidesteps the question:
+  // the shared part keeps the ids we already have.
+  std::string cached_text;
+  std::string pending_text;      // this request's prompt text, for remember()
   bool cache_valid = false;
 };
 
@@ -429,6 +438,9 @@ static void remember(Engine &e, const std::vector<int> &prompt,
                      const std::vector<int> &out) {
   e.cached = prompt;
   e.cached.insert(e.cached.end(), out.begin(), out.end());
+  // The text form must track the token form exactly, so decode what was
+  // generated rather than reusing the string the client will send back.
+  e.cached_text = e.pending_text + tokenizer_decode(e.tk, out);
   e.cache_valid = true;
 }
 
@@ -495,7 +507,7 @@ static int generate(Engine &e, const std::vector<int> &prompt, int max_new,
   while (produced < max_new) {
     if (e.spec) {
       const size_t before = out.size();
-      next = spec_step(e.rt, e.mtp, e.depth, next, out, stats);
+      next = spec_step(e.rt, e.mtp, e.depth, next, out, stats, e.tk.eos);
       produced += (int)(out.size() - before);
     } else {
       out.push_back(next);
@@ -538,7 +550,34 @@ static void handle_chat(Engine &e, int fd, const std::string &body) {
                            "\",\"type\":\"invalid_request_error\"}}");
     return;
   }
-  if (prompt.empty()) prompt = tokenizer_encode(e.tk, render_chat(msgs, think));
+  if (prompt.empty()) {
+    const std::string text = render_chat(msgs, think);
+    // Reuse the ids for the part of the prompt we have already encoded, and
+    // encode only what is new. The seam always falls just after an <|im_end|>,
+    // which is a special token and therefore a hard boundary for the BPE
+    // merges, so encoding the remainder separately gives the same ids as
+    // encoding the whole.
+    if (e.cache_valid && !e.cached_text.empty() &&
+        text.size() > e.cached_text.size() &&
+        text.compare(0, e.cached_text.size(), e.cached_text) == 0) {
+      prompt = e.cached;
+      const std::vector<int> tail =
+          tokenizer_encode(e.tk, text.substr(e.cached_text.size()));
+      prompt.insert(prompt.end(), tail.begin(), tail.end());
+      e.pending_text = text;
+    } else {
+      prompt = tokenizer_encode(e.tk, text);
+      e.pending_text = text;
+      if (e.cache_valid && !e.cached_text.empty()) {
+        size_t c = 0;
+        while (c < e.cached_text.size() && c < text.size() &&
+               e.cached_text[c] == text[c]) ++c;
+        printf("  MISS at char %zu of cached %zu / text %zu\n    cached: [%.40s]\n    text  : [%.40s]\n",
+               c, e.cached_text.size(), text.size(),
+               e.cached_text.c_str() + c, text.c_str() + c);
+      }
+    }
+  }
   if (vp.n > 0 && (int)prompt.size() > e.pb.chunk) {
     send_json(fd, 400,
               "{\"error\":{\"message\":\"prompt with images exceeds the single-chunk "

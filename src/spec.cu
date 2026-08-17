@@ -36,7 +36,7 @@ struct SpecStats {
 //   rt.hlast   : hidden state that produced it
 // Appends the newly committed tokens to `out` and returns the new last_token.
 inline int spec_step(Runtime &rt, MtpHead &M, int D, int last_token,
-                     std::vector<int> &out, SpecStats &stats) {
+                     std::vector<int> &out, SpecStats &stats, int eos = -1) {
   cudaStream_t st = rt.stream;
   const int nd = D - 1;  // number of guesses
 
@@ -68,6 +68,22 @@ inline int spec_step(Runtime &rt, MtpHead &M, int D, int last_token,
   // if drafts[d] == outs[d].
   int k = 0;
   while (k < nd && drafts[k] == outs[k]) ++k;
+
+  // Never commit past the end of the turn.
+  //
+  // A cycle commits 1+k tokens at once, so without this the run can continue
+  // several tokens BEYOND the stop token -- the model happily predicts
+  // <|endoftext|> after <|im_end|> -- and those extra tokens are fed to the
+  // model even though the caller discards them. The state then corresponds to a
+  // token sequence no client will ever send back, which silently defeats the
+  // prefix cache on every naturally-ended reply. Truncating here reuses the
+  // same rewind the rejection path already performs.
+  if (eos >= 0) {
+    if (last_token == eos) k = 0;
+    else
+      for (int i = 0; i < k; ++i)
+        if (drafts[i] == eos) { k = i + 1; break; }
+  }
 
   // Emit the token we came in with plus the accepted guesses. outs[k] is the
   // trunk's own next prediction: it is carried forward as the next cycle's
