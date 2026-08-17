@@ -183,7 +183,7 @@ inline void prefill_chunk(Runtime &rt, PrefillBuf &p, int T,
 
       for (int b = 0; b < T; ++b) {
         const float *qkv_b = p.convout + (size_t)b * LIN_QKV_DIM;
-        k_delta_step<<<LIN_V_HEADS, 128, 0, st>>>(
+        k_delta_step<<<LIN_V_HEADS, 128 * DELTA_DKSPLIT, 0, st>>>(
             S, qkv_b, qkv_b + LIN_Q_DIM, qkv_b + LIN_Q_DIM + LIN_K_DIM,
             p.gb + (size_t)b * LIN_V_HEADS, p.betab + (size_t)b * LIN_V_HEADS,
             p.dnout + (size_t)b * LIN_V_DIM, LIN_HEAD_DIM, LIN_HEAD_DIM,
@@ -218,6 +218,15 @@ inline void prefill_chunk(Runtime &rt, PrefillBuf &p, int T,
 }
 
 // Feed a whole prompt. Returns the token the model predicts next.
+//
+// Chunk size was swept and the full 2048 is right, which is worth recording
+// because a single-chunk measurement argues the opposite. In isolation a chunk
+// gets slower the longer it is -- 486 tok/s at 256 tokens against 340 at 2048 --
+// because attention within a chunk is quadratic. But shortening the chunk does
+// not remove that work, it only moves it: every later chunk still attends over
+// all the history before it, so the total is unchanged and the extra chunks
+// just add launches. End to end on a 908-token prompt: 2048 -> 344 tok/s,
+// 1024 -> 324, 512 -> 321, 256 -> 322.
 inline int prefill(Runtime &rt, PrefillBuf &p, const std::vector<int> &toks) {
   int next = 0;
   for (size_t i = 0; i < toks.size(); i += (size_t)p.chunk) {

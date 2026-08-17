@@ -280,7 +280,7 @@ inline void record_step(Runtime &rt, int B, bool save = false) {
         k_l2norm_heads<<<LIN_K_HEADS, 128, 0, st>>>(qkv_b, LIN_HEAD_DIM,
                                                     1.0f / sqrtf((float)LIN_HEAD_DIM));
         k_l2norm_heads<<<LIN_K_HEADS, 128, 0, st>>>(qkv_b + LIN_Q_DIM, LIN_HEAD_DIM, 1.0f);
-        k_delta_step<<<LIN_V_HEADS, 128, 0, st>>>(
+        k_delta_step<<<LIN_V_HEADS, 128 * DELTA_DKSPLIT, 0, st>>>(
             S, qkv_b, qkv_b + LIN_Q_DIM, qkv_b + LIN_Q_DIM + LIN_K_DIM,
             rt.gb + (size_t)b * LIN_V_HEADS, rt.betab + (size_t)b * LIN_V_HEADS,
             rt.dnout + (size_t)b * LIN_V_DIM, LIN_HEAD_DIM, LIN_HEAD_DIM,
@@ -364,7 +364,7 @@ inline void dn_replay(Runtime &rt, int n) {
       k_l2norm_heads<<<LIN_K_HEADS, 128, 0, st>>>(rt.qkv, LIN_HEAD_DIM,
                                                   1.0f / sqrtf((float)LIN_HEAD_DIM));
       k_l2norm_heads<<<LIN_K_HEADS, 128, 0, st>>>(rt.qkv + LIN_Q_DIM, LIN_HEAD_DIM, 1.0f);
-      k_delta_step<<<LIN_V_HEADS, 128, 0, st>>>(
+      k_delta_step<<<LIN_V_HEADS, 128 * DELTA_DKSPLIT, 0, st>>>(
           S, rt.qkv, rt.qkv + LIN_Q_DIM, rt.qkv + LIN_Q_DIM + LIN_K_DIM, rt.gb,
           rt.betab, rt.dnout, LIN_HEAD_DIM, LIN_HEAD_DIM,
           LIN_V_HEADS / LIN_K_HEADS);

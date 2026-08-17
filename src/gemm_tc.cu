@@ -97,16 +97,26 @@ constexpr int TC_LD = TC_BK + 8;
 // loads WFT + WFN fragments per K-step and issues WFT*WFN MMAs against them, so
 // this ratio is how much tensor-core work each shared-memory read pays for.
 // At 2x2 it was 4 loads for 4 MMAs -- 1:1, and the kernel ran at 23 TFLOP/s.
-// Swept against the whole model at a 256-token chunk (ms per pass, repeated):
-//   warp 2x2  738, 735      warp 4x2  956      warp 2x4  607, 599   <- default
-// and a wider TOKEN tile does not help despite halving weight re-reads
-//   BT=256 warp 2x4  655        BT=128 warp 2x4  603
-// which says this kernel is bound by occupancy and issue, not weight traffic.
+// Swept twice, and the answer MOVED once the staging loops were vectorised --
+// which is the whole lesson. Before vectorising, fewer fatter warps won
+// (2x4 = 603 ms against 2x2's 736) because staging was so expensive that
+// minimising the threads doing it mattered more than parallelism. After
+// vectorising, staging is cheap and more warps win outright:
+//   warp 2x4, 256 thr  442 ms      warp 2x2, 512 thr  376 ms  <- default
+//   warp 1x4, 512 thr  386 ms      warp 1x2, 1024 thr 545 ms
+// A wider TOKEN tile still does not pay (BT=256 warp 2x2 = 403), nor a deeper
+// K tile (BK=128 = 491), nor a wider output tile (BN=256 = 469): all three buy
+// less re-reading at the cost of occupancy, and occupancy wins here.
+//
+// Beware 1024-thread configs: they exceed the 65536-register block budget and
+// the launch fails SILENTLY, which the benchmark reports as an absurd
+// 593 TFLOP/s. Always sanity-check a result against the 250 TFLOP/s machine
+// peak measured by bench/03_mmamax.
 #ifndef TC_WFT_CFG
 #define TC_WFT_CFG 2
 #endif
 #ifndef TC_WFN_CFG
-#define TC_WFN_CFG 4
+#define TC_WFN_CFG 2
 #endif
 constexpr int TC_WFT = TC_WFT_CFG, TC_WFN = TC_WFN_CFG;
 
@@ -137,8 +147,8 @@ __device__ __forceinline__ void tc_load_w(__nv_bfloat16 *ws,
     const int n = n0 + r;
     __nv_bfloat16 *dst = ws + r * LD + g * 16;
     if (n >= N) {
-#pragma unroll
-      for (int c = 0; c < 16; ++c) dst[c] = __float2bfloat16(0.f);
+      *(uint4 *)(dst + 0) = make_uint4(0, 0, 0, 0);
+      *(uint4 *)(dst + 8) = make_uint4(0, 0, 0, 0);
       continue;
     }
     const uint8_t *p = W + ((size_t)n * steps + s) * SWZ_STEP_BYTES;
@@ -151,13 +161,18 @@ __device__ __forceinline__ void tc_load_w(__nv_bfloat16 *ws,
     // One 8-byte read for all 16 weights rather than 16 byte loads. Unpacking
     // is ~35% of this kernel's time (measured by ablation: 15.4 -> 23.7
     // TFLOP/s with it removed), so the loads are worth doing properly.
+    // Build the 16 unpacked values in registers and commit them as two
+    // 16-byte shared stores rather than sixteen 2-byte ones.
     const uint32_t w0 = ((const uint32_t *)v)[0], w1 = ((const uint32_t *)v)[1];
+    __nv_bfloat16 tmp[16];
 #pragma unroll
     for (int c = 0; c < 8; ++c)
-      dst[c] = __float2bfloat16(lut[(w0 >> (c * 4)) & 0xF] * sc);
+      tmp[c] = __float2bfloat16(lut[(w0 >> (c * 4)) & 0xF] * sc);
 #pragma unroll
     for (int c = 0; c < 8; ++c)
-      dst[8 + c] = __float2bfloat16(lut[(w1 >> (c * 4)) & 0xF] * sc);
+      tmp[8 + c] = __float2bfloat16(lut[(w1 >> (c * 4)) & 0xF] * sc);
+    *(uint4 *)(dst + 0) = *(const uint4 *)(tmp + 0);
+    *(uint4 *)(dst + 8) = *(const uint4 *)(tmp + 8);
 #endif
   }
 }
@@ -207,11 +222,35 @@ __global__ void gemm_tc(const uint8_t *__restrict__ W,
   for (int k0 = 0; k0 < K; k0 += BK) {
     __syncthreads();
     tc_load_w<BN, BK, LD, THREADS>(ws, W, n0, N, K, k0, lut, tid);
-    for (int i = tid; i < BT * BK; i += THREADS) {
+#if TC_ABLATE == 2
+    // Ablation: skip the global read of the activation tile. Each block streams
+    // BT*K activations across the K loop, and with N/BN blocks in the N
+    // dimension the same tile is read by every one of them. In BYTES that is
+    // T*K*2 * (N/BN) against the weight matrix's N*K*0.5625 * (T/BT) -- for the
+    // biggest shape at a 256-token chunk, 356 MB of activations against 200 MB
+    // of weights. Whether it COSTS anything depends on whether it lands in L2.
+    for (int i = tid; i < BT * BK; i += THREADS)
+      as[(i / BK) * LD + (i % BK)] = __float2bfloat16(1.0f);
+#else
+    // VECTORISED: 8 bf16 (16 bytes) per thread per step, not one.
+    //
+    // Copying a single 2-byte element at a time turned a 128x64 tile into 8192
+    // separate 2-byte loads and 8192 2-byte shared stores per k-tile per block.
+    // Ablating this loop entirely was worth 604 -> 313 ms, i.e. HALF the
+    // kernel, and it is not the bytes -- the tile is L2-resident -- it is the
+    // instruction count. Both sides are contiguous runs of BK elements and both
+    // are 16-byte aligned (K is a multiple of 8, and LD = BK+8 keeps every row
+    // start 16-byte aligned), so a uint4 copy is legal and cuts the loop by 8x.
+    constexpr int VEC = 8;                       // bf16 per 16-byte word
+    for (int i = tid * VEC; i < BT * BK; i += THREADS * VEC) {
       const int r = i / BK, c = i % BK;
       const int t = t0 + r;
-      as[r * LD + c] = (t < T) ? A[(size_t)t * K + k0 + c] : __float2bfloat16(0.f);
+      uint4 v;
+      if (t < T) v = *(const uint4 *)(A + (size_t)t * K + k0 + c);
+      else v = make_uint4(0, 0, 0, 0);
+      *(uint4 *)(as + r * LD + c) = v;
     }
+#endif
     __syncthreads();
 
     // WFT + WFN fragment loads feed WFT*WFN MMAs. At 4x2 that is 6 loads for 8
@@ -293,6 +332,43 @@ inline void launch_gemm_tc(const uint8_t *W, const __nv_bfloat16 *A, float *C,
   else if (N % 96 == 0)    launch_tc<96, 2>(W, A, C, T, N, K, tscale, ty, st);
   else if (N % 64 == 0)    launch_tc<64, 2>(W, A, C, T, N, K, tscale, ty, st);
   else                     launch_tc<32, 2>(W, A, C, T, N, K, tscale, ty, st);
+}
+
+// ---------------------------------------------------------------------------
+// The DECODE verify pass on tensor cores.
+//
+// A speculative verify is a GEMM with M = draft depth = 4..8 token rows. It has
+// always run on the CUDA-core GEMV in gemv.cu, which at batch 4 costs 77.65 ms
+// against a 62.2 ms bandwidth floor -- the 15 ms gap being 208 GFLOP of FP32
+// FMA at a ~20.9 TFLOPS CUDA-core peak.
+//
+// This was dismissed once on the grounds that the prefill tile is 128 tokens
+// wide and M=4 would waste 32x. That reasoning was wrong: the tile is a
+// template parameter, and one WMMA fragment is 16 rows, so a BT=16
+// instantiation wastes at most 4x at M=4 and 2x at M=8 -- against a tensor-core
+// rate roughly an order of magnitude above the CUDA cores. The arithmetic that
+// matters is not the FLOP ratio but whether the arithmetic disappears behind
+// the weight stream, because the pass is bandwidth bound either way.
+//
+// Activations must be BF16 here, where the decode kernel takes fp32; the caller
+// converts once per pass, which is B*K elements against 14.41 GB of weights.
+inline void launch_gemm_tc_decode(const uint8_t *W, const __nv_bfloat16 *A,
+                                  float *C, int N, int K, float ts,
+                                  cudaStream_t st = 0) {
+  constexpr int BT = 16, BK = TC_BK, LD = BK + 8;
+  if (N % 128 == 0) {
+    constexpr int SMEM = (128 + BT) * LD * (int)sizeof(__nv_bfloat16);
+    auto k = gemm_tc<BT, 128, BK, 1, 4>;
+    static bool o = false;
+    if (!o) { cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM); o = true; }
+    k<<<dim3(N / 128, 1), (128 / 64) * 32, SMEM, st>>>(W, A, C, BT, N, K, ts);
+  } else {
+    constexpr int SMEM = (32 + BT) * LD * (int)sizeof(__nv_bfloat16);
+    auto k = gemm_tc<BT, 32, BK, 1, 2>;
+    static bool o = false;
+    if (!o) { cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM); o = true; }
+    k<<<dim3(N / 32, 1), (32 / 32) * 32, SMEM, st>>>(W, A, C, BT, N, K, ts);
+  }
 }
 
 }  // namespace spark27

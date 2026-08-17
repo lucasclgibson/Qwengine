@@ -26,7 +26,7 @@ LDFLAGS   := -lcuda
 GB      ?= 12
 REPS    ?= 7
 
-BINS  := $(BUILD)/01_bandwidth $(BUILD)/convert $(BUILD)/loader $(BUILD)/qwengine $(BUILD)/qwengine-serve
+BINS  := $(BUILD)/01_bandwidth $(BUILD)/02_readmax $(BUILD)/convert $(BUILD)/loader $(BUILD)/qwengine $(BUILD)/qwengine-serve
 TESTS := $(BUILD)/test_nvfp4 $(BUILD)/test_loader $(BUILD)/test_gemv \
          $(BUILD)/test_spec $(BUILD)/test_gemm_tc $(BUILD)/test_vision $(BUILD)/test_tokenizer $(BUILD)/test_image
 TOOLS := $(BUILD)/gemv_shapes $(BUILD)/spec_probe $(BUILD)/spec_budget \
@@ -43,6 +43,8 @@ $(BUILD):
 
 # ---- CUDA binaries (each is one self-contained translation unit) ------------
 $(BUILD)/01_bandwidth: bench/01_bandwidth.cu | $(BUILD)
+	$(NVCC) $(NVCCFLAGS) -o $@ $< $(LDFLAGS)
+$(BUILD)/02_readmax: bench/02_readmax.cu | $(BUILD)
 	$(NVCC) $(NVCCFLAGS) -o $@ $< $(LDFLAGS)
 $(BUILD)/qwengine: src/main.cu | $(BUILD)
 	$(NVCC) $(NVCCFLAGS) -o $@ $< $(LDFLAGS)

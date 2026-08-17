@@ -163,7 +163,23 @@ __global__ void k_l2norm_heads(float *__restrict__ x, int dim, float extra,
 //   out = exp(g) * (S^T q) + delta * (k . q)
 // so one pass over S yields both S^T k and S^T q, and the second pass only
 // writes. S is 3 MB per layer and L2 is 24 MB, so the write pass hits cache.
-__global__ __launch_bounds__(128) void k_delta_step(
+// DKSPLIT threads cooperate on each output channel instead of one.
+//
+// This kernel is launched once per token per layer -- 24576 times for a
+// 512-token prefill chunk -- and at one block per value head that is 48 blocks
+// of 128 threads: 6144 threads on a part that holds 98304, or 6% of the
+// machine. The dk loop was 128 serial iterations inside each thread while the
+// GPU sat idle. Splitting dk DKSPLIT ways multiplies the threads by DKSPLIT and
+// shortens the serial loop by the same factor; the partial sums reduce through
+// shared memory, which costs one extra barrier per step.
+//
+// The state is [DK][DV] with dv contiguous, so every thread still reads a
+// coalesced run and the access pattern is unchanged -- only how many threads
+// share the work.
+#ifndef DELTA_DKSPLIT
+#define DELTA_DKSPLIT 8
+#endif
+__global__ __launch_bounds__(128 * DELTA_DKSPLIT) void k_delta_step(
     float *__restrict__ S,          // [HV][DK][DV]
     const float *__restrict__ q,    // [HK][DK], already l2-normed and scaled
     const float *__restrict__ k,    // [HK][DK], already l2-normed
@@ -172,46 +188,56 @@ __global__ __launch_bounds__(128) void k_delta_step(
     const float *__restrict__ beta, // [HV]
     float *__restrict__ out,        // [HV][DV]
     int DK, int DV, int group) {
+  constexpr int SP = DELTA_DKSPLIT;
   const int h = blockIdx.x;
-  const int dv = threadIdx.x;
+  const int dv = threadIdx.x % 128;          // output channel
+  const int part = threadIdx.x / 128;        // which slice of dk this thread owns
   float *Sh = S + (size_t)h * DK * DV;
   const float *qh = q + (size_t)(h / group) * DK;   // 48 v-heads share 16 k-heads
   const float *kh = k + (size_t)(h / group) * DK;
 
   __shared__ float sq[128], sk[128], red[32];
-  sq[dv] = qh[dv];
-  sk[dv] = kh[dv];
+  __shared__ float pk[SP][128], pq[SP][128];
+  if (part == 0) { sq[dv] = qh[dv]; sk[dv] = kh[dv]; }
   __syncthreads();
 
   const float gh = __expf(g[h]);
 
-  // Single pass over S: accumulate both S^T k and S^T q for this column.
+  // Single pass over this thread's slice of S: both S^T k and S^T q at once.
+  const int dk0 = part * (DK / SP), dk1 = dk0 + (DK / SP);
   float ak = 0.f, aq = 0.f;
-  for (int dk = 0; dk < DK; ++dk) {
+  for (int dk = dk0; dk < dk1; ++dk) {
     const float s = Sh[(size_t)dk * DV + dv];  // coalesced: dv is the fast axis
     ak += s * sk[dk];
     aq += s * sq[dk];
   }
+  pk[part][dv] = ak; pq[part][dv] = aq;
 
-  // k . q, reduced across the block.
-  float p = sk[dv] * sq[dv];
+  // k . q, reduced across the block. Only the first slice's threads take part,
+  // so the reduction is over exactly 128 lanes however wide the block is.
+  float p = (part == 0) ? sk[dv] * sq[dv] : 0.f;
 #pragma unroll
   for (int o = 16; o; o >>= 1) p += __shfl_xor_sync(0xFFFFFFFFu, p, o);
-  if ((dv & 31) == 0) red[dv >> 5] = p;
+  if (part == 0 && (dv & 31) == 0) red[dv >> 5] = p;
   __syncthreads();
-  if (dv == 0) {
+  if (threadIdx.x == 0) {
     float t = 0.f;
-    for (int i = 0; i < blockDim.x / 32; ++i) t += red[i];
+    for (int i = 0; i < 4; ++i) t += red[i];
     red[0] = t;
   }
   __syncthreads();
   const float kq = red[0];
 
-  const float kv_mem = gh * ak;
-  const float delta = (v[(size_t)h * DV + dv] - kv_mem) * beta[h];
-  out[(size_t)h * DV + dv] = gh * aq + delta * kq;
+  // Recombine the dk slices.
+  float akt = 0.f, aqt = 0.f;
+#pragma unroll
+  for (int i = 0; i < SP; ++i) { akt += pk[i][dv]; aqt += pq[i][dv]; }
 
-  for (int dk = 0; dk < DK; ++dk)
+  const float kv_mem = gh * akt;
+  const float delta = (v[(size_t)h * DV + dv] - kv_mem) * beta[h];
+  if (part == 0) out[(size_t)h * DV + dv] = gh * aqt + delta * kq;
+
+  for (int dk = dk0; dk < dk1; ++dk)
     Sh[(size_t)dk * DV + dv] = Sh[(size_t)dk * DV + dv] * gh + sk[dk] * delta;
 }
 
