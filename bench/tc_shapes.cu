@@ -39,8 +39,8 @@ int main(int argc, char **argv) {
     total += e.bytes;
     if (!sample.count(key)) sample[key] = &e;
   }
-  printf("tile: BT=%d BN=%d BK=%d warps=%d   pass = %.3f GB\n\n",
-         TC_BT, TC_BN, TC_BK, TC_WARPS, total / 1e9);
+  printf("tile: BT=%d BN=%d BK=%d warp=%dx%d frags   pass = %.3f GB\n\n",
+         TC_BT, TC_BN, TC_BK, TC_WFT, TC_WFN, total / 1e9);
 
   int maxK = 0, maxN = 0;
   for (auto &kv : shapes) { maxK = std::max(maxK, kv.first.second); maxN = std::max(maxN, kv.first.first); }

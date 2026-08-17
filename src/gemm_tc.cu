@@ -93,18 +93,29 @@ constexpr int TC_BN = TC_BN_CFG, TC_BT = TC_BT_CFG, TC_BK = TC_BK_CFG;
 // banks and only rows 8 apart collide. 16-way becomes 2-way. 8 is the smallest
 // pad that works because wmma requires ldm to be a multiple of 8 for bf16.
 constexpr int TC_LD = TC_BK + 8;
-constexpr int TC_WARPS = TC_WARPS_CFG;
-constexpr int TC_THREADS = TC_WARPS * 32;
-// Warps tile the output as (TC_BT/32) x (TC_BN/32) quadrants of 32x32.
-constexpr int TC_WT = TC_BT / 32, TC_WN = TC_BN / 32;
-static_assert(TC_WT * TC_WN == TC_WARPS, "warp grid must cover the tile");
+// How many 16x16 fragments each warp owns, in tokens and in outputs. A warp
+// loads WFT + WFN fragments per K-step and issues WFT*WFN MMAs against them, so
+// this ratio is how much tensor-core work each shared-memory read pays for.
+// At 2x2 it was 4 loads for 4 MMAs -- 1:1, and the kernel ran at 23 TFLOP/s.
+// Swept against the whole model at a 256-token chunk (ms per pass, repeated):
+//   warp 2x2  738, 735      warp 4x2  956      warp 2x4  607, 599   <- default
+// and a wider TOKEN tile does not help despite halving weight re-reads
+//   BT=256 warp 2x4  655        BT=128 warp 2x4  603
+// which says this kernel is bound by occupancy and issue, not weight traffic.
+#ifndef TC_WFT_CFG
+#define TC_WFT_CFG 2
+#endif
+#ifndef TC_WFN_CFG
+#define TC_WFN_CFG 4
+#endif
+constexpr int TC_WFT = TC_WFT_CFG, TC_WFN = TC_WFN_CFG;
 
 // Unpack this block's slice of W into shared BF16.
 //
 // For a 32-wide K-tile aligned to 32, all 32 weights of a row live in 16
 // contiguous bytes and share exactly two block scales, so the whole tile is a
 // dense little read rather than a gather.
-template <int BN, int THREADS>
+template <int BN, int BK, int LD, int THREADS>
 __device__ __forceinline__ void tc_load_w(__nv_bfloat16 *ws,
                                           const uint8_t *__restrict__ W,
                                           int n0, int N, int K, int k0,
@@ -120,11 +131,11 @@ __device__ __forceinline__ void tc_load_w(__nv_bfloat16 *ws,
   const int steps = K / 1024;
   const int s = k0 >> 10, j0 = k0 & 1023;
   // Each unit of work is one row's 16-weight group (one block scale).
-  constexpr int GROUPS = TC_BK / 16;
+  constexpr int GROUPS = BK / 16;
   for (int i = tid; i < BN * GROUPS; i += THREADS) {
     const int r = i / GROUPS, g = i % GROUPS;
     const int n = n0 + r;
-    __nv_bfloat16 *dst = ws + r * TC_LD + g * 16;
+    __nv_bfloat16 *dst = ws + r * LD + g * 16;
     if (n >= N) {
 #pragma unroll
       for (int c = 0; c < 16; ++c) dst[c] = __float2bfloat16(0.f);
@@ -151,14 +162,29 @@ __device__ __forceinline__ void tc_load_w(__nv_bfloat16 *ws,
   }
 }
 
-template <int BN>
-__global__ __launch_bounds__((TC_BT / 32) * (BN / 32) * 32) void gemm_tc(
-    const uint8_t *__restrict__ W, const __nv_bfloat16 *__restrict__ A,
-    float *__restrict__ C, int T, int N, int K, float tscale) {
-  constexpr int WN = BN / 32, WT = TC_BT / 32;
-  constexpr int WARPS = WT * WN, THREADS = WARPS * 32;
-  __shared__ __nv_bfloat16 ws[BN * TC_LD];
-  __shared__ __nv_bfloat16 as[TC_BT * TC_LD];
+// BT tokens x BN outputs per block, K consumed BK at a time.
+//
+// SHARED MEMORY IS DYNAMIC, and that is not a stylistic choice. A static
+// __shared__ array is capped at 48 KB per block; the opt-in limit on this chip
+// is 99 KB. That cap was silently deciding the tile size: BT=256 needs ~55 KB
+// and ptxas simply refused it ("uses too much shared data"), which read like a
+// hardware limit and is not one. BT is exactly the knob that decides how often
+// the weights get re-read -- a T-token prompt streams all 13.8 GB ceil(T/BT)
+// times -- so the 48 KB cap was costing a factor of two on every long prompt.
+template <int BT, int BN, int BK, int WFT, int WFN>
+__global__ void gemm_tc(const uint8_t *__restrict__ W,
+                        const __nv_bfloat16 *__restrict__ A,
+                        float *__restrict__ C, int T, int N, int K,
+                        float tscale) {
+  constexpr int LD = BK + 8;              // padded stride, see TC_LD
+  constexpr int WTILE_T = WFT * 16, WTILE_N = WFN * 16;
+  constexpr int WARPS = (BT / WTILE_T) * (BN / WTILE_N);
+  constexpr int THREADS = WARPS * 32;
+  constexpr int WPR = BN / WTILE_N;       // warps across the output dimension
+
+  extern __shared__ __nv_bfloat16 smem[];
+  __nv_bfloat16 *ws = smem;
+  __nv_bfloat16 *as = smem + (size_t)BN * LD;
   __shared__ float lut[16];
 
   const int tid = threadIdx.x;
@@ -168,51 +194,52 @@ __global__ __launch_bounds__((TC_BT / 32) * (BN / 32) * 32) void gemm_tc(
   }
 
   const int n0 = blockIdx.x * BN;
-  const int t0 = blockIdx.y * TC_BT;
+  const int t0 = blockIdx.y * BT;
   const int warp = tid >> 5;
-  const int wt = (warp / WN) * 32, wn = (warp % WN) * 32;  // this warp's quadrant
+  const int wt = (warp / WPR) * WTILE_T, wn = (warp % WPR) * WTILE_N;
 
-  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][2];
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[WFT][WFN];
 #pragma unroll
-  for (int i = 0; i < 2; ++i)
+  for (int i = 0; i < WFT; ++i)
 #pragma unroll
-    for (int j = 0; j < 2; ++j) wmma::fill_fragment(acc[i][j], 0.0f);
+    for (int j = 0; j < WFN; ++j) wmma::fill_fragment(acc[i][j], 0.0f);
 
-  for (int k0 = 0; k0 < K; k0 += TC_BK) {
+  for (int k0 = 0; k0 < K; k0 += BK) {
     __syncthreads();
-    tc_load_w<BN, THREADS>(ws, W, n0, N, K, k0, lut, tid);
-    for (int i = tid; i < TC_BT * TC_BK; i += THREADS) {
-      const int r = i / TC_BK, c = i % TC_BK;
+    tc_load_w<BN, BK, LD, THREADS>(ws, W, n0, N, K, k0, lut, tid);
+    for (int i = tid; i < BT * BK; i += THREADS) {
+      const int r = i / BK, c = i % BK;
       const int t = t0 + r;
-      as[r * TC_LD + c] = (t < T) ? A[(size_t)t * K + k0 + c] : __float2bfloat16(0.f);
+      as[r * LD + c] = (t < T) ? A[(size_t)t * K + k0 + c] : __float2bfloat16(0.f);
     }
     __syncthreads();
 
+    // WFT + WFN fragment loads feed WFT*WFN MMAs. At 4x2 that is 6 loads for 8
+    // MMAs against 4 loads for 4 at the old 2x2 -- the tensor cores get more
+    // work per shared-memory read, which is what they were starved of.
 #pragma unroll
-    for (int kk = 0; kk < TC_BK; kk += 16) {
-      wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> fa[2];
-      wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> fb[2];
+    for (int kk = 0; kk < BK; kk += 16) {
+      wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> fa[WFT];
+      wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> fb[WFN];
 #pragma unroll
-      for (int i = 0; i < 2; ++i)
-        wmma::load_matrix_sync(fa[i], as + (wt + i * 16) * TC_LD + kk, TC_LD);
+      for (int i = 0; i < WFT; ++i)
+        wmma::load_matrix_sync(fa[i], as + (wt + i * 16) * LD + kk, LD);
 #pragma unroll
-      for (int j = 0; j < 2; ++j)
-        wmma::load_matrix_sync(fb[j], ws + (wn + j * 16) * TC_LD + kk, TC_LD);
+      for (int j = 0; j < WFN; ++j)
+        wmma::load_matrix_sync(fb[j], ws + (wn + j * 16) * LD + kk, LD);
 #pragma unroll
-      for (int i = 0; i < 2; ++i)
+      for (int i = 0; i < WFT; ++i)
 #pragma unroll
-        for (int j = 0; j < 2; ++j) wmma::mma_sync(acc[i][j], fa[i], fb[j], acc[i][j]);
+        for (int j = 0; j < WFN; ++j) wmma::mma_sync(acc[i][j], fa[i], fb[j], acc[i][j]);
     }
   }
 
   // Apply the per-tensor scale to the fp32 accumulator, then store straight to
-  // global. C is padded to whole tiles (see launch_gemm_tc), so there is no
-  // bounds check and no shared staging — staging 64x128 floats cost 32 KB and
-  // blew the shared budget by itself.
+  // global. C is padded to whole tiles, so no bounds check and no staging.
 #pragma unroll
-  for (int i = 0; i < 2; ++i)
+  for (int i = 0; i < WFT; ++i)
 #pragma unroll
-    for (int j = 0; j < 2; ++j) {
+    for (int j = 0; j < WFN; ++j) {
 #pragma unroll
       for (int e = 0; e < acc[i][j].num_elements; ++e) acc[i][j].x[e] *= tscale;
       wmma::store_matrix_sync(C + (size_t)(t0 + wt + i * 16) * N + n0 + wn + j * 16,
@@ -237,23 +264,35 @@ __global__ __launch_bounds__((TC_BT / 32) * (BN / 32) * 32) void gemm_tc(
 // instead of ceil(T/8).
 inline bool gemm_tc_ok(int N) { return N % 32 == 0; }
 
+// Launch one instantiation, opting in to the >48 KB shared budget first.
+// cudaFuncSetAttribute has to be called once per kernel before it can use more
+// than 48 KB; the static flag keeps it off the per-launch path.
+template <int BN, int WFN>
+static inline void launch_tc(const uint8_t *W, const __nv_bfloat16 *A, float *C,
+                             int T, int N, int K, float ts, int ty,
+                             cudaStream_t st) {
+  constexpr int LD = TC_BK + 8;
+  constexpr int SMEM = (BN + TC_BT) * LD * (int)sizeof(__nv_bfloat16);
+  constexpr int WARPS = (TC_BT / (TC_WFT * 16)) * (BN / (WFN * 16));
+  auto k = gemm_tc<TC_BT, BN, TC_BK, TC_WFT, WFN>;
+  static bool optin = false;
+  if (!optin) {
+    cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+    optin = true;
+  }
+  k<<<dim3(N / BN, ty), WARPS * 32, SMEM, st>>>(W, A, C, T, N, K, ts);
+}
+
 inline void launch_gemm_tc(const uint8_t *W, const __nv_bfloat16 *A, float *C,
                            int T, int N, int K, float tscale,
                            cudaStream_t st = 0) {
   const int ty = (T + TC_BT - 1) / TC_BT;
-  if (N % TC_BN == 0) {
-    constexpr int THREADS = (TC_BT / 32) * (TC_BN / 32) * 32;
-    gemm_tc<TC_BN><<<dim3(N / TC_BN, ty), THREADS, 0, st>>>(W, A, C, T, N, K, tscale);
-  } else if (N % 96 == 0) {   // 6240 = 96 * 65, the in_zab shape
-    constexpr int THREADS = (TC_BT / 32) * 3 * 32;
-    gemm_tc<96><<<dim3(N / 96, ty), THREADS, 0, st>>>(W, A, C, T, N, K, tscale);
-  } else if (N % 64 == 0) {
-    constexpr int THREADS = (TC_BT / 32) * 2 * 32;
-    gemm_tc<64><<<dim3(N / 64, ty), THREADS, 0, st>>>(W, A, C, T, N, K, tscale);
-  } else {
-    constexpr int THREADS = (TC_BT / 32) * 32;
-    gemm_tc<32><<<dim3(N / 32, ty), THREADS, 0, st>>>(W, A, C, T, N, K, tscale);
-  }
+  // The narrow fallbacks shrink the per-warp output tile to match, so a 32-wide
+  // N never asks for a 32-wide warp tile it cannot fill.
+  if (N % TC_BN == 0)      launch_tc<TC_BN, TC_WFN>(W, A, C, T, N, K, tscale, ty, st);
+  else if (N % 96 == 0)    launch_tc<96, 2>(W, A, C, T, N, K, tscale, ty, st);
+  else if (N % 64 == 0)    launch_tc<64, 2>(W, A, C, T, N, K, tscale, ty, st);
+  else                     launch_tc<32, 2>(W, A, C, T, N, K, tscale, ty, st);
 }
 
 }  // namespace spark27

@@ -221,14 +221,24 @@ static std::string render_chat(
   // anyway, because the prompt itself is what asks for one.
   if (!have_system && think)
     s += std::string("<|im_start|>system\n") + kDefaultSystem + "<|im_end|>\n";
-  for (const auto &m : msgs)
-    s += "<|im_start|>" + m.first + "\n" + m.second + "<|im_end|>\n";
+  // An assistant turn must be replayed EXACTLY as it was generated, opener and
+  // all. The opener below is part of the prompt the model answered, so leaving
+  // it out of the history rewrites what the model was actually shown -- and,
+  // less obviously, it moves the point where consecutive prompts stop agreeing
+  // to before the first reply. That destroys the prefix cache on every turn of
+  // every conversation, which is worth about 10 seconds a message.
+  const char *opener = think ? "<think>\n" : "<think>\n\n</think>\n\n";
+  for (const auto &m : msgs) {
+    s += "<|im_start|>" + m.first + "\n";
+    if (m.first == "assistant") s += opener;
+    s += m.second + "<|im_end|>\n";
+  }
   s += "<|im_start|>assistant\n";
   // Thinking is this checkpoint's default behaviour, so it is not enough to
   // omit the <think> opener -- the model writes one itself. To suppress it,
   // hand it an ALREADY-CLOSED empty think block, which is the convention this
   // model family uses to signal "reasoning done, answer now".
-  s += think ? "<think>\n" : "<think>\n\n</think>\n\n";
+  s += opener;
   return s;
 }
 
@@ -269,6 +279,22 @@ struct Engine {
   int depth = 3, ctx = 8192;
   bool spec = true;
   std::string model_name = MODEL_NAME;
+
+  // PREFIX CACHE.
+  //
+  // The exact token sequence the engine's state currently reflects: the last
+  // request's prompt followed by every token the model actually consumed while
+  // answering it. KV cache, DeltaNet recurrence and rt.pos all correspond to
+  // having read exactly this.
+  //
+  // A chat client re-sends the whole conversation on every turn, so turn N's
+  // prompt is turn N-1's prompt, plus the reply the model just generated, plus
+  // the new user message. That means `cached` is a strict prefix of it and only
+  // the new tail has to be read. Without this the engine re-read the entire
+  // history every message, and time-to-first-token grew without limit: 30
+  // seconds at 5400 tokens of context, against SGLang's 1.3.
+  std::vector<int> cached;
+  bool cache_valid = false;
 };
 
 static double now_s() {
@@ -394,13 +420,48 @@ static bool prep_vision(Engine &e, const std::vector<std::string> &raw_objs,
   return true;
 }
 
+// Record the token sequence the engine's state now reflects: this prompt plus
+// everything the model consumed answering it. Every token in `out` was fed --
+// spec_step advances the position by exactly the number it commits -- so the
+// two concatenated are precisely what the KV cache and the recurrence have
+// seen. `next` is deliberately excluded: it has been predicted but not fed.
+static void remember(Engine &e, const std::vector<int> &prompt,
+                     const std::vector<int> &out) {
+  e.cached = prompt;
+  e.cached.insert(e.cached.end(), out.begin(), out.end());
+  e.cache_valid = true;
+}
+
 // Run one completion. Calls `on_token` with each decoded text delta.
 template <typename F>
 static int generate(Engine &e, const std::vector<int> &prompt, int max_new,
                     F on_token, double *ttft, double *gen_s, SpecStats &stats,
                     const VisionPrep *vp = nullptr) {
-  rt_reset(e.rt);
-  if (e.spec) LCHECK(cudaMemset(e.mtp.dpos, 0, sizeof(int)));
+  // How much of this prompt is already in the engine's state?
+  //
+  // Only a WHOLE-CACHE match counts. The KV cache could be truncated to any
+  // point, but the DeltaNet recurrence cannot: its state is a running summary
+  // with no history to roll back to, so the only position we can resume from is
+  // the one the state is already at. A prompt that diverges anywhere -- an
+  // edited message, a regeneration, a different chat -- falls back to a full
+  // read, which is what used to happen every single time.
+  size_t reuse = 0;
+  // vp is passed unconditionally by the caller and is only meaningful when it
+  // holds images, so test its contents, not the pointer.
+  const bool has_images = vp && vp->n > 0;
+  if (e.cache_valid && !has_images && !e.cached.empty() && prompt.size() > e.cached.size() &&
+      prompt.size() < (size_t)e.ctx &&
+      std::equal(e.cached.begin(), e.cached.end(), prompt.begin()))
+    reuse = e.cached.size();
+  if (reuse)
+    printf("  prefix cache: %zu of %zu prompt tokens already read\n", reuse,
+           prompt.size());
+
+  if (!reuse) {
+    rt_reset(e.rt);
+    if (e.spec) LCHECK(cudaMemset(e.mtp.dpos, 0, sizeof(int)));
+  }
+  e.cache_valid = false;          // set again only on a clean finish
   const double t0 = now_s();
   int next;
   if (vp && vp->n > 0) {
@@ -418,6 +479,10 @@ static int generate(Engine &e, const std::vector<int> &prompt, int max_new,
     prefill_chunk(e.rt, e.pb, (int)prompt.size(), e.img_dev, e.islot_dev, vp->n,
                   e.mpos_dev);
     LCHECK(cudaMemcpy(&next, e.rt.dtok_out, sizeof(int), cudaMemcpyDeviceToHost));
+  } else if (reuse) {
+    // Continue from where the state already is: read only the new tail.
+    const std::vector<int> tail(prompt.begin() + reuse, prompt.end());
+    next = prefill(e.rt, e.pb, tail);
   } else {
     next = prefill(e.rt, e.pb, prompt);
   }
@@ -440,11 +505,16 @@ static int generate(Engine &e, const std::vector<int> &prompt, int max_new,
     // Emit only whole tokens we have not sent, and stop at the end marker.
     while (emitted < out.size()) {
       const int id = out[emitted++];
-      if (id == e.tk.eos) { *gen_s = now_s() - t1; return (int)emitted - 1; }
+      if (id == e.tk.eos) {
+        *gen_s = now_s() - t1;
+        remember(e, prompt, out);
+        return (int)emitted - 1;
+      }
       on_token(tokenizer_decode(e.tk, {id}));
     }
   }
   *gen_s = now_s() - t1;
+  remember(e, prompt, out);
   return produced;
 }
 

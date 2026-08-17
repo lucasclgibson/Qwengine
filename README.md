@@ -154,7 +154,45 @@ tensor-core small-M kernel, not tuning. Everything cheaper has been tried and
 measured; the dead ends are recorded in `src/gemv.cu` next to the code they
 failed to improve.
 
-### Prefill
+### Time to first token, and the prefix cache
+
+In a chat client this was the worst thing about the engine, and it was not a
+kernel problem. Open WebUI re-sends the whole conversation on every message, and
+qwengine re-read all of it every time. Time to first token grew without limit:
+about 10 seconds on a 2200-token history, 30 seconds on 5400.
+
+The engine now remembers the exact token sequence its state reflects — the last
+prompt plus every token the model consumed answering it — and when the next
+request begins with that sequence, it reads only the new tail. Turn 2 onwards
+costs the same as turn 1 of an empty chat:
+
+| turn | before | after | SGLang |
+|---|---|---|---|
+| 1 (cold, 2200 tokens) | 9.8 s | 9.8 s | 1.0 s |
+| 2 | 9.9 s | **0.40 s** | 0.14 s |
+| 5 | 10.3 s | **0.40 s** | 0.14 s |
+
+Only a whole-cache match counts. The KV cache could be truncated anywhere, but
+the DeltaNet recurrence cannot: its state is a running summary with nothing to
+roll back to, so the only position it can resume from is the one it is already
+at. An edited message or a regeneration falls back to a full read.
+
+Two things had to be true for this to work at all, and the second was a bug:
+
+- Every token in the generated run really has been fed to the model — `spec_step`
+  advances the position by exactly the number of tokens it commits — so prompt
+  plus output is precisely what the state has seen.
+- **The chat template has to replay history exactly as it was generated.** The
+  assistant turn is opened with a `<think>` block, and that block was being
+  dropped when the same turn was later re-rendered as history. Consecutive
+  prompts therefore stopped agreeing *before the first reply*, and no cache
+  could ever hit. Rendering history with the opener it was generated with is
+  both more faithful and what makes the cache work.
+
+Cold prefill is still about 9× slower than SGLang and is the largest remaining
+gap in the engine. The section below says where that time goes.
+
+### Prefill throughput
 
 Prefill was ~178 tok/s and is now ~250. Two things were wrong, and both are
 worth describing because neither showed up in a tile-size sweep.
