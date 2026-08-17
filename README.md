@@ -58,9 +58,9 @@ measurements are all wrong in SGLang's favour or ours:
 | decode, code | 33.5 | **36.2** | tok/s |
 | decode, chat | **28.0** | 27.4 | tok/s |
 | decode, essay | **22.2** | 21.2 | tok/s |
-| **decode overall** | **26.1** | 25.6 | tok/s |
-| prefill, 2270 tokens | 486 | **2385** | tok/s |
-| prefill, 6731 tokens | 316 | **1941** | tok/s |
+| **decode overall** | **26.2** | 26.0 | tok/s |
+| prefill, 2267 tokens | 551 | **2157** | tok/s |
+| prefill, 6775 tokens | 346 | **1937** | tok/s |
 
 **Decode is at parity**, winning three prompts of four. **Prefill is still 5-6x
 behind**, and that is the honest headline: this engine is competitive at
@@ -70,14 +70,31 @@ In a chat client the prefix cache hides most of that, because only the first
 message of a conversation pays full prefill (see below) -- but "hidden" is not
 "fixed", and a long paste still costs real seconds.
 
-What it would take to close the rest is known and measured, not mysterious:
-the prefill GEMM runs at 47 TFLOP/s against a machine peak of 250 (bench/03),
-and it is now occupancy-bound at 16 warps/SM rather than bound by loading,
-dequantising or bank conflicts -- all three were measured away. Getting past
-that needs a CUTLASS-class kernel: `ldmatrix` with XOR-swizzled shared layout,
-asynchronous copy driven by `mbarrier`, and warp specialisation. Beyond it sit
-a chunked DeltaNet formulation (17% of prefill) and a properly tiled flash
-attention (18%).
+What it would take to close the rest is known and measured, not mysterious.
+Prefill at a 2048-token chunk now divides as GEMM 54%, attention 18%,
+DeltaNet 10%, and each has a specific answer:
+
+**The GEMM is bound by SHARED-MEMORY WRITES.** Ablating just the stores takes
+the whole model pass from 282 ms to 144, and 47 TFLOP/s to 93 -- against a 250
+TFLOP/s machine peak. Everything else has been measured away: not the global
+loads (ablating them changes nothing now the k-loop is pipelined), not bank
+conflicts (pads of 8/16/24/32 all within 3%), not occupancy (4 blocks/SM is
+*worse*), not the MMA-to-load ratio. Two cheap escapes were tried and both lose:
+halving the store width doubles the store count (423 ms), and loading activation
+fragments straight from global is uncoalesced because a fragment's 16 rows are
+10 KB apart (420 ms). The real fix is to stop staging weights in shared at all
+-- dequantise NVFP4 directly into `mma.sync` fragment registers, whose layout is
+documented where `wmma`'s is opaque. That is a different kernel, not a tuning of
+this one.
+
+**Attention needs tensor cores**, not a bigger tile. It is instruction-bound on
+the warp reduction behind every (query, key) dot. Widening the query tile makes
+it worse, not better (tile 8 = 3407 ms, tile 32 = 4025), and so does splitting
+the warp into lane-groups per query (4187 ms), because that trades shuffles for
+uncoalesced key reads. Flash attention removes the reductions entirely by making
+QK-transpose a matmul.
+
+**DeltaNet is the one already taken.** See below.
 
 ## Why it is fast at all
 

@@ -296,7 +296,26 @@ __global__ void gemm_tc(const uint8_t *__restrict__ W,
   tc_fetch<BN, BK, BT, THREADS, WITER, AITER>(reg, W, A, n0, t0, N, T, K, 0, tid);
   for (int k0 = 0; k0 < K; k0 += BK) {
     __syncthreads();                       // previous tile is finished being read
+    // WHERE THE REMAINING TIME GOES, measured by ablating this one call:
+    // removing the shared stores takes the whole model pass from 282 to 144 ms,
+    // 47 to 93 TFLOP/s. Not the global loads (ablating those changes nothing
+    // now that the k-loop is pipelined), not bank conflicts (pads of
+    // 8/16/24/32 are all within 3%), not occupancy (4 blocks/SM via BK=32 is
+    // WORSE at 336 ms), not the MMA:load ratio (4x4 warps is worse at 320).
+    // It is the volume of shared writes: 32 KB per block per k-tile.
+    //
+    // Two ways out were tried and both lose. Halving the store width to 16
+    // bytes doubles the store count: 423 ms. Loading A fragments straight from
+    // global to skip half the writes gives uncoalesced reads, since a
+    // fragment's 16 rows are K*2 = 10 KB apart: 420 ms.
+    //
+    // The real fix is to stop staging WEIGHTS in shared at all -- dequantise
+    // NVFP4 directly into mma fragment registers with raw mma.sync PTX, whose
+    // register mapping is documented where wmma's is opaque. That is a
+    // different kernel, not a tuning of this one.
+#if TC_ABLATE != 3
     tc_store<BN, BK, BT, LD, THREADS, WITER, AITER>(reg, ws, as, lut, tid);
+#endif
     // Issue the NEXT tile's global reads now. They have no dependency on shared
     // memory, so they overlap the barrier below and the MMAs after it.
     if (k0 + BK < K)
