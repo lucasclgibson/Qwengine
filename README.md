@@ -342,9 +342,14 @@ kernel, the vision tower against the reference, the tokeniser against
 per-batch bandwidth), `tc_shapes` (prefill GEMM against its floor),
 `01_bandwidth` (the 235.6 GB/s figure everything is measured against).
 
-Kernels carry their own history: where a comment says a change was measured and
-rejected, the numbers are there. `src/gemv.cu` in particular is as much a record
-of what did not work as of what did.
+`FINDINGS.md` is the engineering record: the two machine ceilings measured
+rather than assumed, every optimisation that worked, every one that failed and
+why, and the measurement mistakes that sent the work down blind alleys. Most of
+it is negative results, which are the part that is hard to recover later.
+
+Kernels also carry their own history: where a comment says a change was measured
+and rejected, the numbers are there. `src/gemv.cu` and `src/gemm_frag.cu` in
+particular are as much a record of what did not work as of what did.
 
 ---
 
