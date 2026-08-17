@@ -28,7 +28,8 @@ REPS    ?= 7
 
 BINS  := $(BUILD)/01_bandwidth $(BUILD)/02_readmax $(BUILD)/convert $(BUILD)/loader $(BUILD)/qwengine $(BUILD)/qwengine-serve
 TESTS := $(BUILD)/test_nvfp4 $(BUILD)/test_loader $(BUILD)/test_gemv \
-         $(BUILD)/test_spec $(BUILD)/test_gemm_tc $(BUILD)/test_vision $(BUILD)/test_tokenizer $(BUILD)/test_image
+         $(BUILD)/test_spec $(BUILD)/test_gemm_tc $(BUILD)/test_vision $(BUILD)/test_tokenizer $(BUILD)/test_image \
+         $(BUILD)/test_delta
 TOOLS := $(BUILD)/gemv_shapes $(BUILD)/spec_probe $(BUILD)/spec_budget \
          $(BUILD)/tc_shapes $(BUILD)/vocab_probe $(BUILD)/prof_prefill
 
@@ -65,6 +66,8 @@ $(BUILD)/test_vision: test/test_vision.cu | $(BUILD)
 $(BUILD)/test_tokenizer: test/test_tokenizer.cu | $(BUILD)
 	$(NVCC) $(NVCCFLAGS) -o $@ $< $(LDFLAGS)
 $(BUILD)/test_image: test/test_image.cu | $(BUILD)
+	$(NVCC) $(NVCCFLAGS) -o $@ $< $(LDFLAGS)
+$(BUILD)/test_delta: test/test_delta.cu | $(BUILD)
 	$(NVCC) $(NVCCFLAGS) -o $@ $< $(LDFLAGS)
 $(BUILD)/gemv_shapes: bench/gemv_shapes.cu | $(BUILD)
 	$(NVCC) $(NVCCFLAGS) -o $@ $< $(LDFLAGS)

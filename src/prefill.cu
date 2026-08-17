@@ -181,13 +181,24 @@ inline void prefill_chunk(Runtime &rt, PrefillBuf &p, int T,
       k_l2norm_heads<<<dim3(LIN_K_HEADS, T), 128, 0, st>>>(
           p.convout + LIN_Q_DIM, LIN_HEAD_DIM, 1.0f, LIN_QKV_DIM);
 
-      for (int b = 0; b < T; ++b) {
-        const float *qkv_b = p.convout + (size_t)b * LIN_QKV_DIM;
-        k_delta_step<<<LIN_V_HEADS, 128 * DELTA_DKSPLIT, 0, st>>>(
-            S, qkv_b, qkv_b + LIN_Q_DIM, qkv_b + LIN_Q_DIM + LIN_K_DIM,
-            p.gb + (size_t)b * LIN_V_HEADS, p.betab + (size_t)b * LIN_V_HEADS,
-            p.dnout + (size_t)b * LIN_V_DIM, LIN_HEAD_DIM, LIN_HEAD_DIM,
-            LIN_V_HEADS / LIN_K_HEADS);
+      // The recurrence is sequential in tokens but the STATE need not move:
+      // one launch walks the whole chunk with its state slice resident in
+      // shared memory, against T launches that each re-read 3 MB of it.
+      {
+        static bool optin = false;
+        const size_t smem = ((size_t)LIN_HEAD_DIM * DELTA_DVT + 2 * LIN_HEAD_DIM +
+                             2 * DELTA_SPLIT * DELTA_DVT + DELTA_SPLIT) * sizeof(float);
+        if (!optin) {
+          LCHECK(cudaFuncSetAttribute(k_delta_chunk,
+                                      cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                      (int)smem));
+          optin = true;
+        }
+        k_delta_chunk<<<dim3(LIN_V_HEADS, LIN_HEAD_DIM / DELTA_DVT),
+                        DELTA_DVT * DELTA_SPLIT, smem, st>>>(
+            S, p.convout, p.gb, p.betab, p.dnout, T, LIN_HEAD_DIM, LIN_HEAD_DIM,
+            LIN_V_HEADS / LIN_K_HEADS, 0, LIN_Q_DIM, LIN_Q_DIM + LIN_K_DIM,
+            LIN_QKV_DIM);
       }
       k_rmsnorm_gated<<<LIN_V_HEADS * T, 128, 0, st>>>(p.dnout, p.zb, L.dn_norm,
                                                         LIN_HEAD_DIM, RMS_EPS);

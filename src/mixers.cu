@@ -241,6 +241,110 @@ __global__ __launch_bounds__(128 * DELTA_DKSPLIT) void k_delta_step(
     Sh[(size_t)dk * DV + dv] = Sh[(size_t)dk * DV + dv] * gh + sk[dk] * delta;
 }
 
+// The delta rule over a WHOLE CHUNK, with the state resident in shared memory.
+//
+// The per-token kernel above is right for decode, where there is one token to
+// process and the state must come from memory anyway. Prefill called it once
+// per token per layer -- 98304 launches for a 2048-token chunk -- and each
+// launch re-read and rewrote the entire 3 MB state for one token's worth of
+// work. Measured at 6.8 us a launch, that was 665 ms per chunk, 17% of prefill.
+//
+// The recurrence is genuinely sequential, so the tokens cannot be parallelised.
+// But the STATE does not have to move: a block loads its slice once, walks all
+// T tokens against it in shared memory, and writes it back once. The state
+// traffic falls by a factor of T and the launches by the same.
+//
+// A block owns one value head and a DVT-wide slice of the value dimension, so
+// the grid is HV x (DV/DVT) blocks instead of HV, which also puts four times as
+// many blocks on the machine. Thread layout is (dv within slice) + DVT*(dk
+// group), so consecutive lanes touch consecutive dv -- the fast axis of the
+// state -- and every shared access is conflict-free.
+//
+// The arithmetic is identical to k_delta_step, including the order of the dk
+// reduction, so results agree to floating-point reassociation only.
+#ifndef DELTA_DVT
+#define DELTA_DVT 64
+#endif
+#ifndef DELTA_SPLIT
+#define DELTA_SPLIT 4
+#endif
+__global__ __launch_bounds__(DELTA_DVT *DELTA_SPLIT) void k_delta_chunk(
+    float *__restrict__ S,           // [HV][DK][DV]
+    const float *__restrict__ qkv,   // [T][LIN_QKV_DIM], q|k|v interleaved
+    const float *__restrict__ g,     // [T][HV]
+    const float *__restrict__ beta,  // [T][HV]
+    float *__restrict__ out,         // [T][HV*DV]
+    int T, int DK, int DV, int group, int qoff, int koff, int voff, int qkvdim) {
+  constexpr int DVT = DELTA_DVT, SP = DELTA_SPLIT;
+  const int h = blockIdx.x;
+  const int dv0 = blockIdx.y * DVT;
+  const int tid = threadIdx.x;
+  const int dvl = tid % DVT, part = tid / DVT;
+  const int dv = dv0 + dvl;
+  const int kh = h / group;
+  const int per = DK / SP;                       // dk values per thread
+  const int dk0 = part * per;
+
+  extern __shared__ float sm[];
+  float *Ss = sm;                                // [DK][DVT]
+  float *sk = Ss + (size_t)DK * DVT;             // [DK]
+  float *sq = sk + DK;                           // [DK]
+  float *pk = sq + DK;                           // [SP][DVT]
+  float *pq = pk + SP * DVT;                     // [SP][DVT]
+  float *pkq = pq + SP * DVT;                    // [SP]
+
+  float *Sg = S + (size_t)h * DK * DV;
+  for (int i = tid; i < DK * DVT; i += blockDim.x)
+    Ss[i] = Sg[(size_t)(i / DVT) * DV + dv0 + (i % DVT)];
+
+  for (int t = 0; t < T; ++t) {
+    // Barrier here also protects sk/sq from being overwritten while the
+    // previous token's state update is still reading them.
+    __syncthreads();
+    const float *row = qkv + (size_t)t * qkvdim;
+    for (int i = tid; i < DK; i += blockDim.x) {
+      sq[i] = row[qoff + (size_t)kh * DK + i];
+      sk[i] = row[koff + (size_t)kh * DK + i];
+    }
+    __syncthreads();
+
+    float ak = 0.f, aq = 0.f;
+    for (int i = 0; i < per; ++i) {
+      const float s = Ss[(size_t)(dk0 + i) * DVT + dvl];
+      ak += s * sk[dk0 + i];
+      aq += s * sq[dk0 + i];
+    }
+    pk[part * DVT + dvl] = ak;
+    pq[part * DVT + dvl] = aq;
+    // k . q is the same for every dv, so one column of threads computes it.
+    if (dvl == 0) {
+      float p = 0.f;
+      for (int i = 0; i < per; ++i) p += sk[dk0 + i] * sq[dk0 + i];
+      pkq[part] = p;
+    }
+    __syncthreads();
+
+    float akt = 0.f, aqt = 0.f, kq = 0.f;
+    for (int j = 0; j < SP; ++j) {
+      akt += pk[j * DVT + dvl];
+      aqt += pq[j * DVT + dvl];
+      kq += pkq[j];
+    }
+    const float gh = __expf(g[(size_t)t * gridDim.x + h]);
+    const float bt = beta[(size_t)t * gridDim.x + h];
+    const float delta = (row[voff + (size_t)h * DV + dv] - gh * akt) * bt;
+    if (part == 0) out[(size_t)t * gridDim.x * DV + (size_t)h * DV + dv] =
+        gh * aqt + delta * kq;
+    for (int i = 0; i < per; ++i) {
+      float *c = &Ss[(size_t)(dk0 + i) * DVT + dvl];
+      *c = *c * gh + sk[dk0 + i] * delta;
+    }
+  }
+  __syncthreads();
+  for (int i = tid; i < DK * DVT; i += blockDim.x)
+    Sg[(size_t)(i / DVT) * DV + dv0 + (i % DVT)] = Ss[i];
+}
+
 // Gated RMSNorm, per head.  out = norm(x) * weight * silu(z)
 // Ref: Qwen3_5RMSNormGated (modeling_qwen3_5.py:187). Note this one uses
 // `weight *`, NOT the `(1 + weight)` the layer norms use.
