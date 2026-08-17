@@ -420,6 +420,130 @@ __global__ __launch_bounds__(256) void k_attn_decode(
   (void)sh;
 }
 
+// Prefill attention: one block serves a TILE of queries, not a single query.
+//
+// The decode kernel above is right for decode, where there is one query (or a
+// handful of speculative ones) against a long history. Prefill reuses it with
+// one block per (head, query), and that makes every block re-read the whole K
+// and V history: with T queries the key/value traffic is T times larger than
+// the data. At a 2048-token chunk it was 18% of all prefill time even after
+// the score loop was fixed, and it grows quadratically.
+//
+// Here a block owns QT consecutive queries of one head. A timestep's key is
+// loaded once and dotted against all QT queries, and its value is loaded once
+// and blended into all QT outputs, so K/V traffic falls by QT.
+//
+// The causal mask differs per query in the tile -- query i sits at position
+// pos+q0+i and may see t <= pos+q0+i -- so each query has its own limit rather
+// than the tile sharing one.
+#ifndef ATTN_QT
+#define ATTN_QT 8
+#endif
+__global__ __launch_bounds__(256) void k_attn_prefill(
+    const float *__restrict__ q, const float *__restrict__ kc,
+    const float *__restrict__ vc, float *__restrict__ out,
+    const int *__restrict__ dpos, int dim, int kv_heads, int q_heads,
+    float scale, float *__restrict__ scratch, int ctx, int T) {
+  constexpr int QT = ATTN_QT;
+  const int h = blockIdx.x, d = threadIdx.x;
+  const int q0 = blockIdx.y * QT;
+  const int nq = (T - q0) < QT ? (T - q0) : QT;      // last tile may be short
+  const int kvh = h / (q_heads / kv_heads);
+  const int kvdim = kv_heads * dim;
+  const int pos = *dpos;
+  const int tmax = pos + q0 + nq;                    // longest history in this tile
+
+  __shared__ __align__(16) float sq[QT][256];
+  __shared__ float red[QT][32];
+  for (int i = 0; i < nq; ++i)
+    if (d < dim) sq[i][d] = q[(size_t)(q0 + i) * q_heads * dim + (size_t)h * dim + d];
+  __syncthreads();
+
+  const int lane = d & 31, warp = d >> 5, nwarp = blockDim.x >> 5;
+  float4 qa[QT], qb[QT];
+#pragma unroll
+  for (int i = 0; i < QT; ++i) {
+    qa[i] = *(const float4 *)(sq[i] + lane * 4);
+    qb[i] = *(const float4 *)(sq[i] + 128 + lane * 4);
+  }
+
+  // Scores. One warp per timestep; the key is read once and reused QT times.
+  float mx[QT];
+#pragma unroll
+  for (int i = 0; i < QT; ++i) mx[i] = -INFINITY;
+  for (int t = warp; t < tmax; t += nwarp) {
+    const float *kt = kc + (size_t)t * kvdim + (size_t)kvh * dim;
+    const float4 ka = *(const float4 *)(kt + lane * 4);
+    const float4 kb = *(const float4 *)(kt + 128 + lane * 4);
+#pragma unroll
+    for (int i = 0; i < QT; ++i) {
+      if (i >= nq) break;
+      float s = qa[i].x * ka.x + qa[i].y * ka.y + qa[i].z * ka.z + qa[i].w * ka.w
+              + qb[i].x * kb.x + qb[i].y * kb.y + qb[i].z * kb.z + qb[i].w * kb.w;
+#pragma unroll
+      for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(0xFFFFFFFFu, s, o);
+      s *= scale;
+      if (t <= pos + q0 + i) {                       // causal, per query
+        if (lane == 0) scratch[((size_t)(q0 + i) * q_heads + h) * ctx + t] = s;
+        mx[i] = fmaxf(mx[i], s);
+      }
+    }
+  }
+#pragma unroll
+  for (int i = 0; i < QT; ++i)
+    if (lane == 0) red[i][warp] = mx[i];
+  __syncthreads();
+  __shared__ float mrow[QT], irow[QT];
+  if (d < nq) {
+    float m = -INFINITY;
+    for (int w = 0; w < nwarp; ++w) m = fmaxf(m, red[d][w]);
+    mrow[d] = m;
+  }
+  __syncthreads();
+
+  // Exponentiate and sum, one query at a time across the whole block.
+  for (int i = 0; i < nq; ++i) {
+    float *sc = scratch + ((size_t)(q0 + i) * q_heads + h) * ctx;
+    const int lim = pos + q0 + i + 1;
+    const float m = mrow[i];
+    float ls = 0.f;
+    for (int t = d; t < lim; t += blockDim.x) {
+      const float e = __expf(sc[t] - m);
+      sc[t] = e;
+      ls += e;
+    }
+#pragma unroll
+    for (int o = 16; o; o >>= 1) ls += __shfl_xor_sync(0xFFFFFFFFu, ls, o);
+    if (lane == 0) red[0][warp] = ls;
+    __syncthreads();
+    if (d == 0) {
+      float t = 0.f;
+      for (int w = 0; w < nwarp; ++w) t += red[0][w];
+      irow[i] = 1.0f / t;
+    }
+    __syncthreads();
+  }
+
+  // Blend values: thread d owns output channel d, and each value vector is
+  // read once for all QT queries.
+  if (d < dim) {
+    float acc[QT];
+#pragma unroll
+    for (int i = 0; i < QT; ++i) acc[i] = 0.f;
+    for (int t = 0; t < tmax; ++t) {
+      const float vv = vc[(size_t)t * kvdim + (size_t)kvh * dim + d];
+#pragma unroll
+      for (int i = 0; i < QT; ++i) {
+        if (i >= nq) break;
+        if (t <= pos + q0 + i)
+          acc[i] += scratch[((size_t)(q0 + i) * q_heads + h) * ctx + t] * vv;
+      }
+    }
+    for (int i = 0; i < nq; ++i)
+      out[(size_t)(q0 + i) * q_heads * dim + (size_t)h * dim + d] = acc[i] * irow[i];
+  }
+}
+
 // out *= sigmoid(gate)   — the attention output gate, applied before o_proj.
 // Ref: modeling_qwen3_5.py:714  attn_output = attn_output * torch.sigmoid(gate)
 __global__ void k_gate_sigmoid(float *__restrict__ x, const float *__restrict__ gate,

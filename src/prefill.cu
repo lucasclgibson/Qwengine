@@ -149,9 +149,9 @@ inline void prefill_chunk(Runtime &rt, PrefillBuf &p, int T,
                                                                  vc, rt.dpos, KV_DIM);
       // Every query in the chunk is served by the same kernel decode uses;
       // query t sees positions 0..pos+t, which is the causal mask.
-      k_attn_decode<<<dim3(N_Q_HEADS, T), 256, 0, st>>>(
+      k_attn_prefill<<<dim3(N_Q_HEADS, (T + ATTN_QT - 1) / ATTN_QT), 256, 0, st>>>(
           p.qh, kc, vc, p.attn_out, rt.dpos, HEAD_DIM, N_KV_HEADS, N_Q_HEADS,
-          1.0f / sqrtf((float)HEAD_DIM), p.scores, rt.ctx);
+          1.0f / sqrtf((float)HEAD_DIM), p.scores, rt.ctx, T);
       k_gate_sigmoid<<<(T * Q_DIM + 255) / 256, 256, 0, st>>>(p.attn_out, p.gateh,
                                                               T * Q_DIM);
       to_bf16(p.hbf, p.attn_out, (size_t)T * Q_DIM, st);
