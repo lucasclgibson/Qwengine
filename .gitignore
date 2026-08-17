@@ -1,0 +1,8 @@
+build/
+golden/
+*.bin
+.env
+out/
+qwengine.log
+qwengine.pid
+.DS_Store
