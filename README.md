@@ -45,16 +45,30 @@ The goal for this engine was **30 tok/s decode**. It does not hit that. It runs
 says exactly where the missing time goes and what it would take to get it.
 
 It was also meant to beat a well-tuned SGLang setup on the same box "by a
-significant margin". Measured on the same prompts, the two are within a few
-percent of each other. qwengine is **not** decisively faster than SGLang here.
+significant margin". It does not. Both were run on this machine and driven by
+the same `tools/bench.py` over their own HTTP endpoints, same prompts, same
+128-token budget:
+
+| prompt | qwengine | SGLang | |
+|---|---|---|---|
+| reasoning | 20.5 | **21.4** | SGLang |
+| code | 23.2 | **24.0** | SGLang |
+| factual | 19.9 | **23.5** | SGLang |
+| chat | **25.4** | 24.5 | qwengine |
+| **overall** | 22.5 | **23.2** | SGLang by 3% |
+
+(SGLang: `lmsysorg/sglang:qwen38-27b`, `RadixArk/Qwen3.8-27B-NVFP4`, EAGLE
+speculation, FP8 KV cache, flashinfer. Both engines resident simultaneously,
+only one serving at a time.)
+
 A ~50% win was claimed during development and it was wrong: it compared this
 engine's bare decode loop against a throughput figure quoted in someone else's
-README, which is not a comparison at all. Measuring both through their own HTTP
-endpoints on the same prompts is the only version of that number worth keeping.
+README, which is not a comparison at all. The table above is the version worth
+keeping.
 
-What is true is that this reaches roughly the same throughput as a mature,
-heavily-engineered stack, in ~5,800 lines with no dependencies, while also
-doing vision.
+What is true is that this lands within 3% of a mature, heavily-engineered stack
+— one built by a team, on top of PyTorch, FlashInfer and CUTLASS — in ~5,800
+lines with no dependencies at all, while also doing vision.
 
 ---
 
