@@ -28,11 +28,21 @@ int main() {
       "model.language_model.layers.0.mlp.gate_up_proj.weight",    // [17408,5120]
       "model.language_model.layers.0.mlp.down_proj.weight",    // [5120,17408]
       "model.language_model.layers.3.self_attn.qkv_proj.weight", // [12288,5120]
+      // N = 6240, which is NOT a multiple of the 128-wide tile. This shape was
+      // silently falling back to the decode kernel, eight tokens at a time, and
+      // cost a quarter of all prefill time. Keep it in the test so the ragged-N
+      // path is always exercised.
+      "model.language_model.layers.0.linear_attn.in_proj_zab.weight",
   };
 
   for (const char *nm : names) {
     Tensor t = m.get(nm);
     const int N = t.n, K = t.k, T = 64;
+    // A and C must be padded up to whole TC_BT tiles: the kernel writes every
+    // row of the tile and skips bounds checks. Derive it from TC_BT rather
+    // than hardcoding a number -- this used to say 64, and silently became an
+    // out-of-bounds write the moment the tile grew.
+    const int TP = (T + TC_BT - 1) / TC_BT * TC_BT;
 
     std::vector<float> hx((size_t)T * K);
     for (size_t i = 0; i < hx.size(); ++i) hx[i] = sinf(i * 0.013f) * 0.7f;
@@ -42,9 +52,9 @@ int main() {
     float *dx = nullptr, *dc = nullptr, *dref = nullptr;
     __nv_bfloat16 *dxb = nullptr;
     LCHECK(cudaMalloc(&dx, hx.size() * 4));
-    LCHECK(cudaMalloc(&dxb, (size_t)((T + 63) / 64 * 64) * K * 2));
-    LCHECK(cudaMemset(dxb, 0, (size_t)((T + 63) / 64 * 64) * K * 2));
-    LCHECK(cudaMalloc(&dc, (size_t)((T + 63) / 64 * 64) * N * 4));
+    LCHECK(cudaMalloc(&dxb, (size_t)TP * K * 2));
+    LCHECK(cudaMemset(dxb, 0, (size_t)TP * K * 2));
+    LCHECK(cudaMalloc(&dc, (size_t)TP * N * 4));
     LCHECK(cudaMalloc(&dref, (size_t)N * 4));
     LCHECK(cudaMemcpy(dx, hx.data(), hx.size() * 4, cudaMemcpyHostToDevice));
     LCHECK(cudaMemcpy(dxb, hxb.data(), hx.size() * 2, cudaMemcpyHostToDevice));

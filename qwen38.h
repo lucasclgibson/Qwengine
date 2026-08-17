@@ -15,6 +15,13 @@
 
 namespace q38 {
 
+// What the API reports as the model. This is the name of the MODEL, not of the
+// engine: a client asking /v1/models wants to know which weights it is talking
+// to, and every geometry constant below is specific to this checkpoint, so the
+// engine cannot serve anything else. Override at runtime with
+// --served-model-name if a client needs a particular string.
+constexpr const char *MODEL_NAME = "Qwen3.8-27B";
+
 // ---- core geometry --------------------------------------------------------
 constexpr int HIDDEN       = 5120;
 constexpr int N_LAYERS     = 64;

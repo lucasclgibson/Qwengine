@@ -268,7 +268,7 @@ struct Engine {
   int *mpos_dev = nullptr;       // (t,h,w) per prompt token
   int depth = 3, ctx = 8192;
   bool spec = true;
-  std::string model_name = "qwengine";
+  std::string model_name = MODEL_NAME;
 };
 
 static double now_s() {
@@ -548,14 +548,19 @@ int main(int argc, char **argv) {
   // accepts 2.86 but the cycle grows faster than that, and depth 6 accepts no
   // more at all -- the draft chain has run out of accuracy by then.
   int port = 8000, ctx = 8192, depth = 4, imgchunk = 2048;
+  const char *served = nullptr;
   for (int i = 2; i < argc; ++i) {
     if (!strcmp(argv[i], "--port") && i + 1 < argc) port = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--ctx") && i + 1 < argc) ctx = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--depth") && i + 1 < argc) depth = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--imgchunk") && i + 1 < argc) imgchunk = atoi(argv[++i]);
+    else if (!strcmp(argv[i], "--served-model-name") && i + 1 < argc) served = argv[++i];
     else if (!strcmp(argv[i], "--help")) {
       printf("usage: %s <weights.bin> [--port N] [--ctx N] [--depth N]\n"
-             "  --depth 1 disables speculative decoding\n", argv[0]);
+             "                      [--served-model-name NAME]\n"
+             "  --depth 1 disables speculative decoding\n"
+             "  --served-model-name overrides the id reported by /v1/models\n"
+             "                      (default %s)\n", argv[0], MODEL_NAME);
       return 0;
     }
   }
@@ -568,6 +573,7 @@ int main(int argc, char **argv) {
   e.ctx = ctx;
   e.depth = depth;
   e.spec = depth > 1;
+  if (served) e.model_name = served;
   printf("qwengine: loading %s\n", weights);
   e.m = load_model(weights);
   rt_init(e.rt, e.m, ctx);
@@ -611,6 +617,7 @@ int main(int argc, char **argv) {
   a.sin_port = htons((uint16_t)port);
   if (bind(srv, (sockaddr *)&a, sizeof a) < 0) { perror("bind"); return 1; }
   if (listen(srv, 16) < 0) { perror("listen"); return 1; }
+  printf("qwengine: serving %s\n", e.model_name.c_str());
   printf("qwengine: ready on http://0.0.0.0:%d  (ctx %d, draft depth %d%s)\n",
          port, ctx, depth, e.spec ? "" : ", speculation off");
   printf("  POST /v1/chat/completions   GET /v1/models   GET /health\n");
@@ -649,7 +656,7 @@ int main(int argc, char **argv) {
     } else if (head.find("GET /v1/models") == 0) {
       send_json(fd, 200,
                 "{\"object\":\"list\",\"data\":[{\"id\":\"" + e.model_name +
-                    "\",\"object\":\"model\",\"owned_by\":\"qwengine\",\"max_model_len\":" +
+                    "\",\"object\":\"model\",\"owned_by\":\"qwen\",\"max_model_len\":" +
                     std::to_string(ctx) + "}]}");
     } else if (head.find("POST /v1/chat/completions") == 0) {
       printf("request: %zu bytes\n", body.size());

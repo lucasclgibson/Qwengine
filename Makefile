@@ -30,7 +30,7 @@ BINS  := $(BUILD)/01_bandwidth $(BUILD)/convert $(BUILD)/loader $(BUILD)/qwengin
 TESTS := $(BUILD)/test_nvfp4 $(BUILD)/test_loader $(BUILD)/test_gemv \
          $(BUILD)/test_spec $(BUILD)/test_gemm_tc $(BUILD)/test_vision $(BUILD)/test_tokenizer $(BUILD)/test_image
 TOOLS := $(BUILD)/gemv_shapes $(BUILD)/spec_probe $(BUILD)/spec_budget \
-         $(BUILD)/tc_shapes $(BUILD)/vocab_probe
+         $(BUILD)/tc_shapes $(BUILD)/vocab_probe $(BUILD)/prof_prefill
 
 .PHONY: all test bench clean
 
@@ -71,6 +71,8 @@ $(BUILD)/spec_probe: test/spec_probe.cu | $(BUILD)
 $(BUILD)/spec_budget: bench/spec_budget.cu | $(BUILD)
 	$(NVCC) $(NVCCFLAGS) -o $@ $< $(LDFLAGS)
 $(BUILD)/tc_shapes: bench/tc_shapes.cu | $(BUILD)
+	$(NVCC) $(NVCCFLAGS) -o $@ $< $(LDFLAGS)
+$(BUILD)/prof_prefill: bench/prof_prefill.cu | $(BUILD)
 	$(NVCC) $(NVCCFLAGS) -o $@ $< $(LDFLAGS)
 $(BUILD)/vocab_probe: bench/vocab_probe.cu | $(BUILD)
 	$(NVCC) $(NVCCFLAGS) -o $@ $< $(LDFLAGS)

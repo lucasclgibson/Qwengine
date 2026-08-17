@@ -26,21 +26,22 @@ would. Every prompt is run once to warm and then measured.
 
 | prompt | out tokens | end-to-end tok/s | generation tok/s | accepted/cycle |
 |---|---|---|---|---|
-| reasoning | 120 | 20.7 | 22.5 | 2.35 |
-| code | 120 | 23.0 | 24.9 | 2.61 |
-| factual | 25 | 18.8 | 26.7 | 3.11 |
-| chat | 107 | 24.3 | 26.8 | 2.89 |
-| **overall** | **372** | **22.2** | — | — |
+| reasoning | 120 | 20.5 | 22.5 | 2.35 |
+| code | 120 | 23.2 | 24.9 | 2.61 |
+| factual | 25 | 19.9 | 26.6 | 3.11 |
+| chat | 107 | 25.4 | 27.4 | 2.97 |
+| **overall** | **372** | **22.5** | — | — |
 
 - **end-to-end** is what the client sees: prefill, generation, HTTP, everything.
 - **generation** is the decode loop alone, which is the number engines usually quote.
-- **time to first token** is 0.40 s for a short chat prompt; prefill runs at ~178 tok/s.
+- **time to first token** is 0.31 s for a short chat prompt. Prefill runs at
+  ~250 tok/s on a 900-token prompt, ~215 tok/s on a 2800-token one.
 - Weights on disk: **16.7 GB**. Cold start ~40 s, warm start ~4 s.
 
 ### Honesty about the target and about SGLang
 
 The goal for this engine was **30 tok/s decode**. It does not hit that. It runs
-22.5–26.8 tok/s depending on how predictable the text is, and the section below
+22.5–27.4 tok/s depending on how predictable the text is, and the section below
 says exactly where the missing time goes and what it would take to get it.
 
 It was also meant to beat a well-tuned SGLang setup on the same box "by a
@@ -139,10 +140,40 @@ tensor-core small-M kernel, not tuning. Everything cheaper has been tried and
 measured; the dead ends are recorded in `src/gemv.cu` next to the code they
 failed to improve.
 
-**Prefill has a bigger and easier win.** `build/tc_shapes` shows the prefill GEMM
-running at 21–27% of its own memory floor (50–64 GB/s against 235). Sweeping
-every tile configuration does not fix it, so the kernel itself is wrong, not its
-parameters. Fixing it is worth roughly 4× on time-to-first-token.
+### Prefill
+
+Prefill was ~178 tok/s and is now ~250. Two things were wrong, and both are
+worth describing because neither showed up in a tile-size sweep.
+
+**Every shared-memory row started on bank 0.** The tiles are stored row-major at
+their natural stride of `TC_BK` bf16 = 128 bytes, and shared memory is exactly
+32 four-byte banks = 128 bytes wide. So row *r* began at bank `(r*32) % 32 = 0`,
+and each `wmma::load_matrix_sync` — which reads 16 rows at once — serialised 16
+ways. This is invisible to a sweep because *every* power-of-two tile width has
+the property, so every configuration measured equally badly. Padding the stride
+by 8 elements (the smallest pad wmma allows for bf16) makes rows land on banks
+`4r % 32`, turning a 16-way conflict into a 2-way one. With the conflict gone
+the tile optimum moved too, from a 64-token tile to a 128-token one.
+
+**A 6240-wide projection was falling off the tensor-core path entirely.** The
+launcher required `N % 128 == 0` and sent anything else to the *decode* kernel,
+eight prompt tokens at a time. The comment claimed this only caught two tiny
+gate projections. It did not: the fused `in_zab` projection is [6240, 5120], and
+6240 is not a multiple of 128, so an 18 MB matrix was re-read once per group of
+8 tokens — 64 times for a 512-token chunk, across 48 layers, about **55 GB of
+pure waste per chunk**. It was a quarter of all prefill time. Every N in this
+model is a multiple of 32, so the tile width is now chosen per shape (128, 96,
+64 or 32, widest that divides) and the ragged case costs 131 ms per chunk
+instead of 555.
+
+What is left, per 512-token chunk:
+
+| | ms | |
+|---|---|---|
+| `gemm_tc` | 999 | 56% — at 23 TFLOP/s; each warp does one 32×32 tile, so fragment loads and MMAs are 1:1. A wider per-warp tile would amortise the loads. |
+| `k_delta_step` | 432 | 24% — the DeltaNet recurrence, one step per token per layer, re-reading 3.1 MB of state each time. Needs a chunked formulation to batch it. |
+| `gemm_tc<96>` | 131 | 7% — the ragged projection above |
+| `k_attn_decode` | 122 | 7% |
 
 Two things were checked and are *not* available: the lm_head has no padding to
 reclaim (248,077 of 248,320 rows are real vocabulary), and a 2-bit draft head
