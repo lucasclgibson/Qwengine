@@ -97,16 +97,22 @@ constexpr int TC_LD = TC_BK + 8;
 // loads WFT + WFN fragments per K-step and issues WFT*WFN MMAs against them, so
 // this ratio is how much tensor-core work each shared-memory read pays for.
 // At 2x2 it was 4 loads for 4 MMAs -- 1:1, and the kernel ran at 23 TFLOP/s.
-// Swept twice, and the answer MOVED once the staging loops were vectorised --
-// which is the whole lesson. Before vectorising, fewer fatter warps won
-// (2x4 = 603 ms against 2x2's 736) because staging was so expensive that
-// minimising the threads doing it mattered more than parallelism. After
-// vectorising, staging is cheap and more warps win outright:
-//   warp 2x4, 256 thr  442 ms      warp 2x2, 512 thr  376 ms  <- default
-//   warp 1x4, 512 thr  386 ms      warp 1x2, 1024 thr 545 ms
-// A wider TOKEN tile still does not pay (BT=256 warp 2x2 = 403), nor a deeper
-// K tile (BK=128 = 491), nor a wider output tile (BN=256 = 469): all three buy
-// less re-reading at the cost of occupancy, and occupancy wins here.
+// Swept THREE times, and the answer moved twice -- which is the lesson worth
+// keeping. A tile sweep is only valid for the kernel it was run against.
+//
+//                              warp 2x2   warp 2x4
+//   original (2-byte staging)     736 ms     603 ms
+//   vectorised staging            376        442
+//   + software-pipelined k-loop   295        279     <- default
+//
+// Fat warps won at first because staging was so expensive that minimising the
+// threads doing it beat parallelism; thin warps won once staging was cheap; fat
+// warps win again now that the pipeline wants registers more than it wants
+// threads. Re-sweep after every structural change.
+//
+// Still unhelpful, all three times: a wider token tile (BT=256), a deeper K
+// tile (BK=128 = 316 ms), a wider output tile (BN=256 = 300 ms). Each buys less
+// re-reading at the cost of occupancy, and occupancy wins here.
 //
 // Beware 1024-thread configs: they exceed the 65536-register block budget and
 // the launch fails SILENTLY, which the benchmark reports as an absurd
@@ -116,7 +122,7 @@ constexpr int TC_LD = TC_BK + 8;
 #define TC_WFT_CFG 2
 #endif
 #ifndef TC_WFN_CFG
-#define TC_WFN_CFG 2
+#define TC_WFN_CFG 4
 #endif
 constexpr int TC_WFT = TC_WFT_CFG, TC_WFN = TC_WFN_CFG;
 
@@ -125,55 +131,99 @@ constexpr int TC_WFT = TC_WFT_CFG, TC_WFN = TC_WFN_CFG;
 // For a 32-wide K-tile aligned to 32, all 32 weights of a row live in 16
 // contiguous bytes and share exactly two block scales, so the whole tile is a
 // dense little read rather than a gather.
-template <int BN, int BK, int LD, int THREADS>
-__device__ __forceinline__ void tc_load_w(__nv_bfloat16 *ws,
-                                          const uint8_t *__restrict__ W,
-                                          int n0, int N, int K, int k0,
-                                          const float *lut, int tid) {
-  // NOTE: the per-tensor scale is deliberately NOT applied here.
-  //
-  // An E2M1 level has 1 mantissa bit and an E4M3 block scale has 3, so their
-  // product needs at most 6 — and BF16 has 8. Dequantised weights are
-  // therefore EXACT in BF16, and this GEMM agrees with the fp32 decode kernel
-  // to ~5e-7. Multiplying by the arbitrary per-tensor float here destroys that
-  // exactness and costs three orders of magnitude of accuracy (measured:
-  // 5e-7 -> 1.5e-3). It is applied to the fp32 accumulator instead.
+// The weights and activations for ONE k-tile, held in registers between the
+// global read and the shared-memory store.
+//
+// Splitting the tile load into fetch-then-store is what lets the k-loop
+// software-pipeline: the global reads for tile k+1 are issued BEFORE the MMAs
+// of tile k, so ~600 clocks of DRAM latency are paid while the tensor cores are
+// busy instead of while the whole block sits at a barrier. It costs about a
+// dozen registers per thread and NO extra shared memory, so the block count per
+// SM is unchanged -- which matters, because double-buffering the shared tiles
+// instead would have halved it.
+template <int WITER, int AITER>
+struct TileRegs {
+  uint2 wv[WITER];        // 16 packed 4-bit weights per group
+  float sc[WITER];        // that group's block scale
+  bool live[WITER];       // false for rows past N
+  uint4 av[AITER];        // 8 activations each
+};
+
+// Phase 1: global -> registers. Touches no shared memory, so it can be issued
+// while other warps are still reading the previous tile out of shared.
+template <int BN, int BK, int BT, int THREADS, int WITER, int AITER>
+__device__ __forceinline__ void tc_fetch(TileRegs<WITER, AITER> &r,
+                                         const uint8_t *__restrict__ W,
+                                         const __nv_bfloat16 *__restrict__ A,
+                                         int n0, int t0, int N, int T, int K,
+                                         int k0, int tid) {
   const int steps = K / 1024;
   const int s = k0 >> 10, j0 = k0 & 1023;
-  // Each unit of work is one row's 16-weight group (one block scale).
   constexpr int GROUPS = BK / 16;
-  for (int i = tid; i < BN * GROUPS; i += THREADS) {
-    const int r = i / GROUPS, g = i % GROUPS;
-    const int n = n0 + r;
-    __nv_bfloat16 *dst = ws + r * LD + g * 16;
-    if (n >= N) {
+#pragma unroll
+  for (int it = 0; it < WITER; ++it) {
+    const int i = tid + it * THREADS;
+    r.live[it] = false;
+    if (i >= BN * GROUPS) continue;
+    const int row = i / GROUPS, g = i % GROUPS;
+    const int n = n0 + row;
+    if (n >= N) continue;
+    const uint8_t *p = W + ((size_t)n * steps + s) * SWZ_STEP_BYTES;
+    r.wv[it] = *(const uint2 *)(p + ((j0 + g * 16) >> 1));
+    r.sc[it] = e4m3(p[SWZ_VAL_BYTES + ((j0 + g * 16) >> 4)]);
+    r.live[it] = true;
+  }
+  constexpr int VEC = 8;
+#pragma unroll
+  for (int it = 0; it < AITER; ++it) {
+    const int i = (tid + it * THREADS) * VEC;
+    r.av[it] = make_uint4(0, 0, 0, 0);
+    if (i >= BT * BK) continue;
+    const int t = t0 + i / BK;
+    if (t < T) r.av[it] = *(const uint4 *)(A + (size_t)t * K + k0 + (i % BK));
+  }
+}
+
+// Phase 2: registers -> shared, unpacking NVFP4 to BF16 on the way.
+//
+// The per-tensor scale is deliberately NOT applied here. An E2M1 level has 1
+// mantissa bit and an E4M3 block scale has 3, so their product needs at most 6
+// -- and BF16 has 8. Dequantised weights are therefore EXACT in BF16, and this
+// GEMM agrees with the fp32 decode kernel to ~5e-7. Multiplying by the
+// arbitrary per-tensor float here destroys that exactness and costs three
+// orders of magnitude of accuracy (measured: 5e-7 -> 1.5e-3). It goes on the
+// fp32 accumulator instead.
+template <int BN, int BK, int BT, int LD, int THREADS, int WITER, int AITER>
+__device__ __forceinline__ void tc_store(const TileRegs<WITER, AITER> &r,
+                                         __nv_bfloat16 *ws, __nv_bfloat16 *as,
+                                         const float *lut, int tid) {
+  constexpr int GROUPS = BK / 16;
+#pragma unroll
+  for (int it = 0; it < WITER; ++it) {
+    const int i = tid + it * THREADS;
+    if (i >= BN * GROUPS) continue;
+    __nv_bfloat16 *dst = ws + (i / GROUPS) * LD + (i % GROUPS) * 16;
+    if (!r.live[it]) {
       *(uint4 *)(dst + 0) = make_uint4(0, 0, 0, 0);
       *(uint4 *)(dst + 8) = make_uint4(0, 0, 0, 0);
       continue;
     }
-    const uint8_t *p = W + ((size_t)n * steps + s) * SWZ_STEP_BYTES;
-    const uint8_t *v = p + ((j0 + g * 16) >> 1);             // 8 bytes = 16 weights
-    const float sc = e4m3(p[SWZ_VAL_BYTES + ((j0 + g * 16) >> 4)]);
-#if TC_ABLATE == 1
-#pragma unroll
-    for (int c = 0; c < 16; ++c) dst[c] = __float2bfloat16(sc);
-#else
-    // One 8-byte read for all 16 weights rather than 16 byte loads. Unpacking
-    // is ~35% of this kernel's time (measured by ablation: 15.4 -> 23.7
-    // TFLOP/s with it removed), so the loads are worth doing properly.
-    // Build the 16 unpacked values in registers and commit them as two
-    // 16-byte shared stores rather than sixteen 2-byte ones.
-    const uint32_t w0 = ((const uint32_t *)v)[0], w1 = ((const uint32_t *)v)[1];
+    const uint32_t w0 = r.wv[it].x, w1 = r.wv[it].y;
+    const float sc = r.sc[it];
     __nv_bfloat16 tmp[16];
 #pragma unroll
-    for (int c = 0; c < 8; ++c)
-      tmp[c] = __float2bfloat16(lut[(w0 >> (c * 4)) & 0xF] * sc);
+    for (int c = 0; c < 8; ++c) tmp[c] = __float2bfloat16(lut[(w0 >> (c * 4)) & 0xF] * sc);
 #pragma unroll
-    for (int c = 0; c < 8; ++c)
-      tmp[8 + c] = __float2bfloat16(lut[(w1 >> (c * 4)) & 0xF] * sc);
+    for (int c = 0; c < 8; ++c) tmp[8 + c] = __float2bfloat16(lut[(w1 >> (c * 4)) & 0xF] * sc);
     *(uint4 *)(dst + 0) = *(const uint4 *)(tmp + 0);
     *(uint4 *)(dst + 8) = *(const uint4 *)(tmp + 8);
-#endif
+  }
+  constexpr int VEC = 8;
+#pragma unroll
+  for (int it = 0; it < AITER; ++it) {
+    const int i = (tid + it * THREADS) * VEC;
+    if (i >= BT * BK) continue;
+    *(uint4 *)(as + (i / BK) * LD + (i % BK)) = r.av[it];
   }
 }
 
@@ -219,43 +269,33 @@ __global__ void gemm_tc(const uint8_t *__restrict__ W,
 #pragma unroll
     for (int j = 0; j < WFN; ++j) wmma::fill_fragment(acc[i][j], 0.0f);
 
+  // SOFTWARE-PIPELINED K-LOOP.
+  //
+  // The loop used to be [barrier][read global + dequant into shared][barrier]
+  // [MMA], which serialises DRAM latency against tensor-core work: the whole
+  // block arrives at the barrier together, issues its loads together, and
+  // stalls together. Ablation put the cost of that staging at HALF the kernel.
+  //
+  // Now the global reads for tile k+1 are issued between the two barriers of
+  // tile k, so they are in flight across both the barrier and the MMAs that
+  // follow. Nothing is double-buffered in shared -- only in registers -- so
+  // blocks per SM are unchanged.
+  constexpr int GROUPS = BK / 16;
+  constexpr int WITER = (BN * GROUPS + THREADS - 1) / THREADS;
+  constexpr int AITER = (BT * BK / 8 + THREADS - 1) / THREADS;
+  TileRegs<WITER, AITER> reg;
+
+  tc_fetch<BN, BK, BT, THREADS, WITER, AITER>(reg, W, A, n0, t0, N, T, K, 0, tid);
   for (int k0 = 0; k0 < K; k0 += BK) {
-    __syncthreads();
-    tc_load_w<BN, BK, LD, THREADS>(ws, W, n0, N, K, k0, lut, tid);
-#if TC_ABLATE == 2
-    // Ablation: skip the global read of the activation tile. Each block streams
-    // BT*K activations across the K loop, and with N/BN blocks in the N
-    // dimension the same tile is read by every one of them. In BYTES that is
-    // T*K*2 * (N/BN) against the weight matrix's N*K*0.5625 * (T/BT) -- for the
-    // biggest shape at a 256-token chunk, 356 MB of activations against 200 MB
-    // of weights. Whether it COSTS anything depends on whether it lands in L2.
-    for (int i = tid; i < BT * BK; i += THREADS)
-      as[(i / BK) * LD + (i % BK)] = __float2bfloat16(1.0f);
-#else
-    // VECTORISED: 8 bf16 (16 bytes) per thread per step, not one.
-    //
-    // Copying a single 2-byte element at a time turned a 128x64 tile into 8192
-    // separate 2-byte loads and 8192 2-byte shared stores per k-tile per block.
-    // Ablating this loop entirely was worth 604 -> 313 ms, i.e. HALF the
-    // kernel, and it is not the bytes -- the tile is L2-resident -- it is the
-    // instruction count. Both sides are contiguous runs of BK elements and both
-    // are 16-byte aligned (K is a multiple of 8, and LD = BK+8 keeps every row
-    // start 16-byte aligned), so a uint4 copy is legal and cuts the loop by 8x.
-    constexpr int VEC = 8;                       // bf16 per 16-byte word
-    for (int i = tid * VEC; i < BT * BK; i += THREADS * VEC) {
-      const int r = i / BK, c = i % BK;
-      const int t = t0 + r;
-      uint4 v;
-      if (t < T) v = *(const uint4 *)(A + (size_t)t * K + k0 + c);
-      else v = make_uint4(0, 0, 0, 0);
-      *(uint4 *)(as + r * LD + c) = v;
-    }
-#endif
+    __syncthreads();                       // previous tile is finished being read
+    tc_store<BN, BK, BT, LD, THREADS, WITER, AITER>(reg, ws, as, lut, tid);
+    // Issue the NEXT tile's global reads now. They have no dependency on shared
+    // memory, so they overlap the barrier below and the MMAs after it.
+    if (k0 + BK < K)
+      tc_fetch<BN, BK, BT, THREADS, WITER, AITER>(reg, W, A, n0, t0, N, T, K,
+                                                  k0 + BK, tid);
     __syncthreads();
 
-    // WFT + WFN fragment loads feed WFT*WFN MMAs. At 4x2 that is 6 loads for 8
-    // MMAs against 4 loads for 4 at the old 2x2 -- the tensor cores get more
-    // work per shared-memory read, which is what they were starved of.
 #pragma unroll
     for (int kk = 0; kk < BK; kk += 16) {
       wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> fa[WFT];

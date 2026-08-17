@@ -41,6 +41,13 @@ else
 fi
 
 # 3. serve
+# Fail loudly if the port is taken. A previous server left running here meant
+# every measurement for an hour was taken against a stale binary, because the
+# new one exited with "Address already in use" into a log nobody read.
+if command -v ss >/dev/null && ss -ltn 2>/dev/null | grep -q ":$PORT "; then
+  echo "port $PORT is already in use -- stop the existing server first (./stop.sh)"
+  exit 1
+fi
 echo "==> serving on http://0.0.0.0:$PORT"
 nohup ./build/qwengine-serve "$WEIGHTS" --port "$PORT" --ctx "$CTX" --depth "$DEPTH" \
   > qwengine.log 2>&1 &
